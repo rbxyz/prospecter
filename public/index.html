@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prospecter</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <h1>Prospecter</h1>
+    <nav>
+      <button class="tab active" data-tab="campaigns">Campanhas</button>
+      <button class="tab" data-tab="instances">Números</button>
+      <button class="tab" data-tab="inbound">Respostas</button>
+      <button class="tab" data-tab="optouts">Descadastrados</button>
+      <button class="tab" data-tab="watchtower">WatchTower</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- Campanhas -->
+    <section id="tab-campaigns" class="panel">
+      <div class="toolbar">
+        <h2>Campanhas</h2>
+        <button class="primary" id="btn-new-campaign">+ Nova campanha</button>
+      </div>
+      <div id="campaign-list" class="list"></div>
+    </section>
+
+    <!-- Números -->
+    <section id="tab-instances" class="panel" hidden>
+      <div class="toolbar">
+        <h2>Números de prospecção</h2>
+        <form id="form-new-instance" class="inline">
+          <input name="name" placeholder="nome-do-numero (ex.: vendas-01)" required pattern="[a-zA-Z0-9_\-]{2,40}">
+          <button class="primary">+ Adicionar número</button>
+        </form>
+      </div>
+      <p class="hint">Cada número é uma instância da Evolution API. Conecte lendo o QR Code no WhatsApp do celular (Aparelhos conectados → Conectar um aparelho).</p>
+      <div id="instance-list" class="grid"></div>
+    </section>
+
+    <!-- Respostas -->
+    <section id="tab-inbound" class="panel" hidden>
+      <div class="toolbar"><h2>Respostas recebidas</h2><button id="btn-refresh-inbound">Atualizar</button></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Quando</th><th>Contato</th><th>Telefone</th><th>Número</th><th>Mensagem</th></tr></thead>
+        <tbody id="inbound-list"></tbody>
+      </table></div>
+    </section>
+
+    <!-- Descadastrados -->
+    <section id="tab-optouts" class="panel" hidden>
+      <div class="toolbar">
+        <h2>Descadastrados</h2>
+        <form id="form-optout" class="inline">
+          <input name="phone" placeholder="Telefone para bloquear" required>
+          <button>Bloquear</button>
+        </form>
+      </div>
+      <p class="hint">Contatos que pediram para sair (ou foram bloqueados manualmente) nunca recebem mensagens de nenhuma campanha.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Telefone</th><th>Nome</th><th>Desde</th><th></th></tr></thead>
+        <tbody id="optout-list"></tbody>
+      </table></div>
+    </section>
+
+    <!-- WatchTower -->
+    <section id="tab-watchtower" class="panel" hidden>
+      <div class="toolbar"><h2>WatchTower</h2><span id="wt-badge" class="badge"></span></div>
+      <div class="card">
+        <div id="wt-status" class="meta"></div>
+        <div class="actions" id="wt-actions"></div>
+      </div>
+
+      <form id="form-wt-settings" class="card" hidden style="margin-top:12px">
+        <h4>Ao disparar</h4>
+        <label id="wt-empresa-wrap" hidden>Empresa<select name="empresaId"></select></label>
+        <label class="check"><input type="checkbox" name="annotateSends"> Anotar no histórico do prospecto cada mensagem enviada</label>
+        <label class="check"><input type="checkbox" name="moveOnReply"> Quando o contato responder, mover o prospecto de etapa</label>
+        <div class="row">
+          <label>Só se estiver em<select name="moveFromStageId"></select></label>
+          <label>Mover para<select name="moveToStageId"></select></label>
+        </div>
+        <p class="hint" id="wt-stage-warning"></p>
+        <p class="hint">Quem responde "SAIR" é descadastrado e não muda de etapa. Prospectos que já avançaram no funil nunca voltam.</p>
+        <menu><button class="primary">Salvar</button></menu>
+      </form>
+
+      <div class="card" style="margin-top:12px">
+        <h4>Escritas no WatchTower</h4>
+        <div id="wt-outbox" class="stats"></div>
+        <div id="wt-outbox-failures" class="hint"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Modal: importar do WatchTower -->
+  <dialog id="dlg-wt-import">
+    <form method="dialog" id="form-wt-import">
+      <h3>Importar prospectos do WatchTower</h3>
+      <input type="hidden" name="id">
+      <div class="row">
+        <label>Etapa<select name="etapaId"></select></label>
+        <label>Situação
+          <select name="situacao">
+            <option value="abertos">Abertos</option>
+            <option value="todos">Todos</option>
+            <option value="ganhos">Ganhos</option>
+            <option value="perdidos">Perdidos</option>
+          </select>
+        </label>
+      </div>
+      <label>Busca (nome, contato, e-mail ou documento)<input name="busca"></label>
+      <fieldset>
+        <legend>Pastas <small>(nenhuma marcada = todas)</small> <input id="wt-pasta-filter" placeholder="filtrar pastas…" style="width:auto"></legend>
+        <div id="wt-pastas" class="checks" style="max-height:220px;overflow:auto"></div>
+      </fieldset>
+      <p class="hint">
+        Variáveis extras: <code>{{empresa}}</code> <code>{{contato}}</code> <code>{{cidade}}</code> <code>{{pasta}}</code>
+        <code>{{documento}}</code> <code>{{email}}</code> <code>{{responsavel}}</code>. Com vários telefones, o celular é tentado primeiro e
+        os demais servem de reserva se o primeiro não tiver WhatsApp.
+      </p>
+      <div id="wt-import-result" class="result"></div>
+      <menu>
+        <button value="cancel" formnovalidate>Fechar</button>
+        <button value="preview">Pré-visualizar</button>
+        <button class="primary" value="import">Importar</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Modal: campanha -->
+  <dialog id="dlg-campaign">
+    <form method="dialog" id="form-campaign">
+      <h3 id="campaign-form-title">Nova campanha</h3>
+      <input type="hidden" name="id">
+      <label>Nome<input name="name" required></label>
+      <label>Mensagem
+        <textarea name="template" rows="6" required placeholder="{Oi|Olá} {{primeiro_nome}}, tudo bem? ..."></textarea>
+      </label>
+      <p class="hint">
+        Variáveis: <code>{{nome}}</code> <code>{{primeiro_nome}}</code> <code>{{telefone}}</code> e qualquer coluna do CSV (ex.: <code>{{empresa}}</code>).
+        Variações aleatórias: <code>{Oi|Olá|E aí}</code> — ajudam a não enviar textos idênticos.
+      </p>
+      <div class="preview" id="campaign-preview"></div>
+      <button type="button" id="btn-preview">Pré-visualizar</button>
+
+      <fieldset>
+        <legend>Números que vão disparar <small>(nenhum marcado = todos)</small></legend>
+        <div id="campaign-instances" class="checks"></div>
+      </fieldset>
+
+      <div class="row">
+        <label>Intervalo mín. (s)<input type="number" name="delayMinS" min="5" value="60" required></label>
+        <label>Intervalo máx. (s)<input type="number" name="delayMaxS" min="5" value="180" required></label>
+        <label>Início<input type="time" name="windowStart" value="09:00" required></label>
+        <label>Fim<input type="time" name="windowEnd" value="18:00" required></label>
+      </div>
+      <fieldset>
+        <legend>Dias da semana</legend>
+        <div class="checks" id="campaign-weekdays"></div>
+      </fieldset>
+      <label class="check"><input type="checkbox" name="randomTimes" checked> Sortear os horários de envio de cada dia dentro da janela</label>
+      <p class="hint" style="margin-top:-6px">Os envios de cada número (até o limite diário) caem em horários aleatórios entre o início e o fim da janela, diferentes a cada dia. Desmarcado, envia assim que a janela abre, respeitando só o intervalo.</p>
+      <label class="check"><input type="checkbox" name="skipReplied" checked> Não enviar para quem já respondeu alguma mensagem antes</label>
+
+      <menu>
+        <button value="cancel" formnovalidate>Cancelar</button>
+        <button class="primary" value="save">Salvar</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Modal: importar contatos -->
+  <dialog id="dlg-import">
+    <form method="dialog" id="form-import">
+      <h3>Importar contatos</h3>
+      <input type="hidden" name="id">
+      <p class="hint">
+        CSV com cabeçalho — a coluna <code>telefone</code> é obrigatória, <code>nome</code> é opcional e as demais viram variáveis.
+        Separador <code>,</code> ou <code>;</code>. Também aceita um telefone por linha.
+      </p>
+      <input type="file" id="import-file" accept=".csv,.txt,text/csv,text/plain">
+      <textarea name="input" rows="10" placeholder="telefone;nome;empresa&#10;11999998888;Maria Silva;Acme"></textarea>
+      <div id="import-result" class="result"></div>
+      <menu>
+        <button value="cancel" formnovalidate>Fechar</button>
+        <button class="primary" value="import">Importar</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Modal: mensagens da campanha -->
+  <dialog id="dlg-messages" class="wide">
+    <form method="dialog">
+      <h3 id="messages-title">Mensagens</h3>
+      <div class="row">
+        <select id="messages-filter">
+          <option value="">Todas</option>
+          <option value="pending">Na fila</option>
+          <option value="sent">Enviadas</option>
+          <option value="failed">Falharam</option>
+          <option value="invalid">Sem WhatsApp</option>
+          <option value="skipped">Puladas</option>
+          <option value="blocked">Bloqueadas</option>
+        </select>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Status</th><th>Contato</th><th>Telefone</th><th>Número</th><th>Enviada</th><th>Respondeu</th><th>Detalhe</th></tr></thead>
+        <tbody id="messages-list"></tbody>
+      </table></div>
+      <menu><button value="close">Fechar</button></menu>
+    </form>
+  </dialog>
+
+  <!-- Modal: prévia com contatos reais -->
+  <dialog id="dlg-preview">
+    <form method="dialog">
+      <h3 id="preview-title">Prévia</h3>
+      <p class="hint">Os próximos 5 contatos da fila, exatamente como vão receber (as variações {a|b} mudam a cada envio).</p>
+      <div id="preview-summary" class="result"></div>
+      <div id="preview-samples" class="preview" style="margin-top:12px"></div>
+      <menu><button value="close">Fechar</button></menu>
+    </form>
+  </dialog>
+
+  <!-- Modal: envio de teste -->
+  <dialog id="dlg-test">
+    <form method="dialog" id="form-test">
+      <h3>Envio de teste</h3>
+      <input type="hidden" name="template">
+      <input type="hidden" name="campaignId">
+      <label>Enviar pelo número<select name="instance" required></select></label>
+      <label>Para o telefone (o seu)<input name="phone" required placeholder="11999998888"></label>
+      <label>Nome do contato<input name="name" placeholder="vazio = usa os dados do próximo contato da fila"></label>
+      <div id="test-result" class="result"></div>
+      <menu>
+        <button value="cancel" formnovalidate>Fechar</button>
+        <button class="primary" value="send">Enviar teste</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Modal: QR Code -->
+  <dialog id="dlg-qr">
+    <form method="dialog">
+      <h3 id="qr-title">Conectar número</h3>
+      <div id="qr-box" class="qr"></div>
+      <p class="hint" id="qr-status">Abra o WhatsApp → Aparelhos conectados → Conectar um aparelho e leia o QR Code.</p>
+      <menu><button value="close">Fechar</button></menu>
+    </form>
+  </dialog>
+
+  <div id="toast" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
