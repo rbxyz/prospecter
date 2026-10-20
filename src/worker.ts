@@ -5,7 +5,7 @@ import { evolutionInstances, sentTodayByInstance, setCachedState } from './insta
 import { jidToPhone, phoneKey } from './phone.ts';
 import { currentWindowEnd, isWithinWindow, localDayKey, nextWindowStart, planSlots, randomBetween } from './schedule.ts';
 import { contactVars, renderChecked } from './template.ts';
-import { enqueueNote, getSettings } from './watchtower.ts';
+import { enqueueMove, enqueueNote, getSettings } from './watchtower.ts';
 
 const TICK_MS = 3_000;
 const MAX_ATTEMPTS = 3;
@@ -246,6 +246,26 @@ async function markSkipped(id: number, reason: string, status: 'skipped' | 'inva
   return false;
 }
 
+/** Após um envio: anota no histórico do prospecto e, se configurado, muda a etapa (ex.: Novo → Iniciado atendimento). */
+async function recordInWatchtower(prospectId: string, campaign: Campaign, instance: string, number: string, text: string): Promise<void> {
+  try {
+    const wt = await getSettings();
+    if (wt.annotateSends) {
+      const sender = (await evolutionInstances()).get(instance);
+      const from = jidToPhone(sender?.ownerJid) ?? instance;
+      await enqueueNote(
+        prospectId,
+        `Prospecter: mensagem enviada por WhatsApp para ${number} (número ${from}, campanha "${campaign.name}").\n\n${text}`,
+      );
+    }
+    if (wt.moveEnabled && wt.moveTrigger === 'send' && wt.moveFromStageId && wt.moveToStageId) {
+      await enqueueMove(prospectId, wt.moveFromStageId, wt.moveToStageId);
+    }
+  } catch (err) {
+    console.warn('[worker] falha ao enfileirar escrita no WatchTower:', (err as Error).message);
+  }
+}
+
 /** Primeiro telefone da lista (na ordem dada) que tem WhatsApp, já no formato do JID. */
 async function pickWhatsappNumber(instance: string, phones: string[]): Promise<string | null> {
   const results = await evolution.whatsappNumbers(instance, phones);
@@ -285,14 +305,7 @@ async function send(campaign: Campaign, msg: QueuedMessage, instance: string): P
       WHERE id = ${msg.id}`;
     console.log(`[worker] campanha ${campaign.id}: enviado para ${number} via ${instance}`);
 
-    if (msg.wt_prospect_id && (await getSettings()).annotateSends) {
-      const sender = (await evolutionInstances()).get(instance);
-      const from = jidToPhone(sender?.ownerJid) ?? instance;
-      await enqueueNote(
-        msg.wt_prospect_id,
-        `Prospecter: mensagem enviada por WhatsApp para ${number} (número ${from}, campanha "${campaign.name}").\n\n${text}`,
-      ).catch((err) => console.warn('[worker] falha ao enfileirar anotação no WatchTower:', err.message));
-    }
+    if (msg.wt_prospect_id) await recordInWatchtower(msg.wt_prospect_id, campaign, instance, number, text);
     return true;
   } catch (err) {
     const error = (err as Error).message.slice(0, 500);

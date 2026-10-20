@@ -533,7 +533,8 @@ async function loadWatchtower() {
     form.moveFromStageId.value = s.settings.moveFromStageId ?? '';
     form.moveToStageId.value = s.settings.moveToStageId ?? '';
     form.annotateSends.checked = s.settings.annotateSends;
-    form.moveOnReply.checked = s.settings.moveOnReply;
+    form.moveEnabled.checked = s.settings.moveEnabled;
+    form.moveTrigger.value = s.settings.moveTrigger;
     updateStageWarning();
   }
 
@@ -567,7 +568,8 @@ $('#form-wt-settings').addEventListener('submit', (e) => {
       body: {
         empresaId: f.empresaId.value,
         annotateSends: f.annotateSends.checked,
-        moveOnReply: f.moveOnReply.checked,
+        moveEnabled: f.moveEnabled.checked,
+        moveTrigger: f.moveTrigger.value,
         moveFromStageId: f.moveFromStageId.value,
         moveToStageId: f.moveToStageId.value,
       },
@@ -631,19 +633,36 @@ $('#wt-pasta-filter').addEventListener('keydown', (e) => e.key === 'Enter' && e.
 
 $('#form-wt-import').addEventListener('submit', (e) => {
   const action = e.submitter?.value;
-  if (action !== 'preview' && action !== 'import') return;
+  if (!['preview', 'import', 'prune'].includes(action)) return;
   e.preventDefault();
   const f = e.target;
   const body = {
     etapaId: f.etapaId.value,
     situacao: f.situacao.value,
     busca: f.busca.value,
+    cnae: f.cnae.value,
     pastaIds: $$('input[name=pastaIds]:checked', f).map((i) => i.value),
   };
   const out = $('#wt-import-result');
   out.textContent = 'Consultando o WatchTower…';
   run(async () => {
     try {
+      if (action === 'prune') {
+        if (body.cnae === 'todos') return (out.textContent = 'Escolha "Só CNAE principal" ou "Só CNAE secundário" para aplicar à fila.');
+        const url = `/api/campaigns/${f.id.value}/watchtower-prune`;
+        const dry = await api(url, { method: 'POST', body: { cnae: body.cnae, dryRun: true } });
+        out.textContent = '';
+        if (!dry.removed) return (out.textContent = `Nada a remover: os ${dry.pendingBefore} contatos na fila já batem com o filtro.`);
+        const ok = confirm(
+          `${dry.removed} de ${dry.pendingBefore} contatos na fila não batem com o filtro e sairão da fila (as mensagens já enviadas não mudam).\n\n` +
+            `Ex.: ${dry.removedSample.join(', ')}\n\nRemover da fila?`,
+        );
+        if (!ok) return;
+        const r = await api(url, { method: 'POST', body: { cnae: body.cnae } });
+        out.textContent = `Removidos da fila: ${r.removed}\nContinuam na fila: ${r.kept}` + (r.notFoundInWatchtower ? `\nSem vínculo com o WatchTower (mantidos): ${r.notFoundInWatchtower}` : '');
+        loadCampaigns();
+        return;
+      }
       if (action === 'preview') {
         const r = await api('/api/watchtower/preview', { method: 'POST', body });
         out.textContent =

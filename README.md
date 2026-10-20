@@ -50,7 +50,7 @@ O Prospecter se conecta ao servidor MCP do WatchTower para puxar prospectos e re
 O que é escrito de volta no WatchTower (configurável na aba):
 
 - **Cada envio** vira uma anotação no histórico do prospecto, com o texto enviado.
-- **Na primeira resposta**, o prospecto vai de "Novo" para "Iniciado atendimento" (as etapas são escolhidas no painel). Só move quem ainda está na etapa de origem; quem responde "SAIR" não muda de etapa.
+- **A cada envio**, o prospecto vai de "Novo" para "Iniciado atendimento" (etapas e gatilho, envio ou primeira resposta, escolhidos no painel). Só move quem ainda está na etapa de origem, então quem já avançou no funil nunca volta.
 
 As escritas passam por uma fila com novas tentativas: se o WatchTower estiver fora do ar, o disparo continua normalmente.
 
@@ -60,6 +60,22 @@ Para testar sem dados reais, use o servidor MCP falso:
 node scripts/mock-watchtower.ts   # http://localhost:4100/mcp, token "mock-token"
 # .env: WATCHTOWER_MCP_URL=http://host.docker.internal:4100/mcp  WATCHTOWER_MCP_TOKEN=mock-token
 ```
+
+## Banco externo (Neon) e conversas do WhatsApp
+
+Por padrão o Prospecter usa o Postgres do compose. Para concentrar os dados num Postgres externo (ex.: Neon), defina `APP_DATABASE_URL` no `.env`: ela tem prioridade sobre `DATABASE_URL`, tanto no host quanto no compose. A Evolution continua usando o Postgres do compose.
+
+Para levar os dados existentes para o banco novo, com o app parado:
+
+```bash
+docker compose stop app
+node scripts/copy-db.ts <url-origem> <url-destino>   # aplica as migrações no destino e faz upsert de tudo, mantendo os ids
+docker compose up -d app
+```
+
+O script pode ser rodado de novo: o que já existe no destino é atualizado, nada é duplicado.
+
+O app também guarda as conversas das instâncias do WhatsApp (`wa_contacts` e `wa_messages`), inclusive o que foi falado direto pelo celular, e liga cada conversa ao contato do Prospecter com o mesmo telefone. A carga completa roda ao iniciar e a cada 30 minutos; as mensagens novas chegam na hora pelo webhook. Para forçar uma carga, use `POST /api/whatsapp/sync`. `GET /api/whatsapp/conversations` lista uma linha por número, com a empresa e as contagens de enviadas e recebidas.
 
 ## Desenvolvimento
 

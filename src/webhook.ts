@@ -3,46 +3,15 @@ import { sql } from './db.ts';
 import { evolution, type ConnectionState } from './evolution.ts';
 import { setCachedState } from './instances.ts';
 import { isOptOut } from './optout.ts';
-import { jidToPhone, phoneKey } from './phone.ts';
+import { phoneKey } from './phone.ts';
+import { extractText, senderPhone, type EvoMessage } from './wa-map.ts';
+import { recordWebhookMessages } from './wa-sync.ts';
 import { enqueueMove, getSettings } from './watchtower.ts';
-
-interface MessageKey {
-  remoteJid?: string;
-  remoteJidAlt?: string;
-  senderPn?: string;
-  fromMe?: boolean;
-}
-
-interface UpsertData {
-  key?: MessageKey;
-  pushName?: string;
-  message?: Record<string, any>;
-}
 
 export interface WebhookPayload {
   event?: string;
   instance?: string;
   data?: any;
-}
-
-/** Texto de uma mensagem recebida (texto puro, texto estendido ou legenda de mídia). */
-export function extractText(message: Record<string, any> | undefined): string {
-  if (!message) return '';
-  return (
-    message.conversation ??
-    message.extendedTextMessage?.text ??
-    message.imageMessage?.caption ??
-    message.videoMessage?.caption ??
-    message.documentMessage?.caption ??
-    message.buttonsResponseMessage?.selectedDisplayText ??
-    message.listResponseMessage?.title ??
-    ''
-  );
-}
-
-/** Telefone do remetente. Em contas com LID, o número real vem em remoteJidAlt/senderPn. */
-export function senderPhone(key: MessageKey): string | null {
-  return jidToPhone(key.remoteJid) ?? jidToPhone(key.remoteJidAlt) ?? jidToPhone(key.senderPn);
 }
 
 export async function handleWebhook(payload: WebhookPayload): Promise<void> {
@@ -56,13 +25,15 @@ export async function handleWebhook(payload: WebhookPayload): Promise<void> {
   }
 
   if (event !== 'messages.upsert') return;
-  const items: UpsertData[] = Array.isArray(payload.data) ? payload.data : [payload.data];
-  for (const item of items) {
-    if (item?.key) await handleIncoming(instance, item);
-  }
+  const items: EvoMessage[] = (Array.isArray(payload.data) ? payload.data : [payload.data]).filter((i) => i?.key);
+  // Guarda a conversa (nos dois sentidos); uma falha aqui não pode impedir o registro da resposta.
+  await recordWebhookMessages(instance, items).catch((err) =>
+    console.warn('[webhook] falha ao gravar mensagem do WhatsApp:', (err as Error).message),
+  );
+  for (const item of items) await handleIncoming(instance, item);
 }
 
-async function handleIncoming(instance: string, item: UpsertData): Promise<void> {
+async function handleIncoming(instance: string, item: EvoMessage): Promise<void> {
   const key = item.key!;
   if (key.fromMe) return;
   if (key.remoteJid?.endsWith('@g.us') || key.remoteJid === 'status@broadcast') return;
@@ -95,10 +66,10 @@ async function handleIncoming(instance: string, item: UpsertData): Promise<void>
       ORDER BY sent_at DESC LIMIT 1
     )`;
 
-  // Primeira resposta de um prospecto do WatchTower: avança no funil (ex.: Novo → Iniciado atendimento).
+  // Com "mover ao responder": a primeira resposta avança o prospecto no funil.
   if (!optOut && !contact.last_reply_at && contact.wt_prospect_id) {
     const wt = await getSettings();
-    if (wt.moveOnReply && wt.moveFromStageId && wt.moveToStageId) {
+    if (wt.moveEnabled && wt.moveTrigger === 'reply' && wt.moveFromStageId && wt.moveToStageId) {
       await enqueueMove(contact.wt_prospect_id, wt.moveFromStageId, wt.moveToStageId);
     }
   }

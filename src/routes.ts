@@ -6,8 +6,9 @@ import { evolution } from './evolution.ts';
 import { evolutionInstances, listInstances } from './instances.ts';
 import { normalizePhone, phoneKey } from './phone.ts';
 import { contactVars, renderChecked, renderTemplate, templateVars, validateTemplate } from './template.ts';
+import { syncWhatsApp } from './wa-sync.ts';
 import * as wt from './watchtower.ts';
-import { prospectToContact } from './watchtower-map.ts';
+import { matchesCnae, prospectToContact, type CnaeFilter } from './watchtower-map.ts';
 import { handleWebhook, optOutContact } from './webhook.ts';
 import { waitingReasons, type Campaign } from './worker.ts';
 
@@ -292,6 +293,28 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
+  // ---------- Conversas das instâncias do WhatsApp ----------
+  app.post('/api/whatsapp/sync', async () => syncWhatsApp());
+
+  /** Uma linha por número (o mesmo contato pode ter conversa @lid e @s.whatsapp.net), sem grupos. */
+  app.get('/api/whatsapp/conversations', async () =>
+    sql`
+      SELECT coalesce(m.phone_key, m.instance || ':' || m.jid) AS key,
+             max(m.phone) AS phone,
+             max(m.contact_id) AS contact_id,
+             max(c.name) AS contact_name,
+             max(c.vars->>'empresa') AS empresa,
+             (array_agg(m.push_name ORDER BY m.sent_at DESC) FILTER (WHERE m.push_name IS NOT NULL))[1] AS push_name,
+             count(*) FILTER (WHERE m.from_me)::int AS sent,
+             count(*) FILTER (WHERE NOT m.from_me)::int AS received,
+             max(m.sent_at) AS last_message_at
+      FROM wa_messages m LEFT JOIN contacts c ON c.id = m.contact_id
+      WHERE m.jid NOT LIKE '%@g.us'
+      GROUP BY 1
+      ORDER BY last_message_at DESC NULLS LAST
+      LIMIT 500`,
+  );
+
   // ---------- WatchTower (MCP) ----------
   app.get('/api/watchtower/status', async () => wt.getStatus());
 
@@ -331,7 +354,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   app.patch('/api/watchtower/settings', async (req) => {
     const b = req.body as Body;
     const patch: Partial<wt.WtSettings> = {};
-    for (const k of ['empresaId', 'annotateSends', 'moveOnReply', 'moveFromStageId', 'moveToStageId'] as const) {
+    for (const k of ['empresaId', 'annotateSends', 'moveEnabled', 'moveTrigger', 'moveFromStageId', 'moveToStageId'] as const) {
       if (b[k] !== undefined) (patch as Body)[k] = b[k] === '' ? null : b[k];
     }
     return wt.saveSettings(patch);
@@ -350,6 +373,51 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     etapaId: b.etapaId || undefined,
     situacao: b.situacao || 'abertos',
     busca: b.busca?.trim() || undefined,
+    // Foco em escritórios de contabilidade: por padrão só CNAE principal.
+    cnae: (['todos', 'principal', 'secundario'].includes(b.cnae) ? b.cnae : 'principal') as CnaeFilter,
+  });
+
+  /**
+   * Tira da fila da campanha (só mensagens ainda não enviadas) os prospectos que não batem com o
+   * filtro de CNAE e atualiza a variável {{origem}} dos contatos. Com dryRun, só mostra o que faria.
+   * Quem sai pode ser importado de novo depois (ex.: numa campanha só de CNAE secundário).
+   */
+  app.post('/api/campaigns/:id/watchtower-prune', async (req, reply) => {
+    const { id } = req.params as Body;
+    const { cnae = 'principal', dryRun = false } = (req.body ?? {}) as Body;
+    if (!['principal', 'secundario'].includes(cnae)) return reply.code(400).send({ error: 'cnae deve ser principal ou secundario' });
+    const prospects = new Map((await wt.listProspects({ situacao: 'todos', cnae: 'todos' })).map((p) => [p.id, p]));
+
+    const queue = await sql<{ message_id: string; contact_id: string; name: string; phone: string; wt_prospect_id: string | null }[]>`
+      SELECT m.id AS message_id, c.id AS contact_id, c.name, c.phone, c.wt_prospect_id
+      FROM messages m JOIN contacts c ON c.id = m.contact_id
+      WHERE m.campaign_id = ${id} AND m.status = 'pending'`;
+    const remove = queue.filter((q) => {
+      const p = q.wt_prospect_id ? prospects.get(q.wt_prospect_id) : undefined;
+      return p ? !matchesCnae(p, cnae) : false;
+    });
+    const notFound = queue.filter((q) => !q.wt_prospect_id || !prospects.has(q.wt_prospect_id)).length;
+
+    if (!dryRun) {
+      await sql.begin(async (tx) => {
+        for (const p of prospects.values()) {
+          await tx`
+            UPDATE contacts SET vars = vars || ${tx.json({ origem: p.origem ?? '' })}
+            WHERE wt_prospect_id = ${p.id}`;
+        }
+        if (remove.length) {
+          await tx`DELETE FROM messages WHERE status = 'pending' AND id IN ${tx(remove.map((r) => r.message_id))}`;
+        }
+      });
+    }
+    return {
+      dryRun,
+      pendingBefore: queue.length,
+      removed: remove.length,
+      kept: queue.length - remove.length,
+      notFoundInWatchtower: notFound,
+      removedSample: remove.slice(0, 15).map((r) => r.name || r.phone),
+    };
   });
 
   app.post('/api/watchtower/preview', async (req) => {

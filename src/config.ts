@@ -14,7 +14,8 @@ function list(name: string, fallback: string): string[] {
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   timezone: process.env.TZ ?? 'America/Sao_Paulo',
-  databaseUrl: required('DATABASE_URL'),
+  /** APP_DATABASE_URL (banco externo, ex.: Neon) tem prioridade sobre o Postgres local/do compose. */
+  databaseUrl: process.env.APP_DATABASE_URL || required('DATABASE_URL'),
   evolution: {
     url: required('EVOLUTION_URL').replace(/\/+$/, ''),
     apiKey: required('EVOLUTION_API_KEY'),

@@ -29,7 +29,9 @@ Node 24 runs `.ts` files directly using native type stripping. There is no compi
 ## Architecture
 
 - **`src/server.ts`**: startup order is migrate, then static files and routes, then listen, then `syncWebhooks()` (with retries, since Evolution boots slowly), then `startWorker()`. `PANEL_PASSWORD` enables Basic Auth (user `admin`) on everything except `/webhook/*` and `/health`.
-- **`src/db.ts`**: postgres.js client. `migrate()` applies `src/migrations/*.sql` in filename order and tracks them in `schema_migrations`. To change the schema, add a new numbered file; never edit an applied one.
+- **`src/db.ts`**: postgres.js client. `migrate()` calls `runMigrations()` (`src/migrations.ts`, no config import so scripts can use it), which applies `src/migrations/*.sql` in filename order and tracks them in `schema_migrations`. To change the schema, add a new numbered file; never edit an applied one.
+- **Database location:** `APP_DATABASE_URL` (external Postgres, currently Neon) takes precedence over `DATABASE_URL` both on the host and in compose; Evolution keeps its own DB in the compose Postgres. `scripts/copy-db.ts <from> <to>` migrates the target and upserts every table by primary key in one transaction, preserving ids and resetting sequences; it is re-runnable. Add new tables to its `TABLES` list in FK order.
+- **WhatsApp conversation mirror (`src/wa-sync.ts`):** `syncWhatsApp()` pulls `/chat/findContacts` and every page of `/chat/findMessages` for each instance into `wa_contacts`/`wa_messages`, then fills `phone` on `@lid` rows and links `contact_id` via `phone_key = ANY(contacts.phone_keys)`. It runs 20s after startup, every 30 min, and on `POST /api/whatsapp/sync`; the webhook also records every `messages.upsert` item (both directions) before the reply handling. Row mapping is the pure `src/wa-map.ts` (also home of `extractText`/`senderPhone`). In sent messages `pushName` is our own name, so it is dropped.
 - **`src/worker.ts`**: polling dispatcher that ticks every 3s. For each `running` campaign inside its time window, it picks an available instance and claims one `pending` message with `FOR UPDATE SKIP LOCKED`. An instance is available when it is connected (`open`), enabled, not busy, past its random delay, and under its daily limit. Sends run concurrently across instances but one at a time per instance. Per-instance pacing (`nextAvailableAt`, `busy`) is kept **in memory**, so this assumes a single app process. On startup, `sending` rows are reset to `pending`. Failed sends retry up to 3 attempts, then the message is marked `failed`. A campaign is set to `done` when nothing is left pending or sending.
 - **Random send times (`campaigns.random_times`, default on):**
   - For each (instance, campaign, day), `slotsFor()` draws `daily_limit - sentToday` random times between now and the end of the window (`planSlots`, spaced at least `delay_min_s` apart).
@@ -47,12 +49,13 @@ Node 24 runs `.ts` files directly using native type stripping. There is no compi
 
   `callTool()` parses the first text block as JSON; WatchTower appends extra blocks such as "Empresa: ...". It reconnects once if the session drops, and injects `empresaId` only when one has been chosen in settings (only needed when the connection reaches more than one company).
 - **WatchTower write-back goes through `watchtower_outbox`**, never inline:
-  - The worker enqueues a `note` after each sent message.
-  - The webhook enqueues a `move` on a contact's *first* non-opt-out reply.
+  - The worker enqueues a `note` after each sent message and, with `moveTrigger = 'send'` (default), a `move`.
+  - With `moveTrigger = 'reply'`, the webhook enqueues the `move` on a contact's *first* non-opt-out reply instead. `enqueueMovesForSent()` (at startup and on settings save) backfills moves for prospects already sent to; it is idempotent and only runs in send mode. Legacy settings with `moveOnReply` map to `moveEnabled`.
   - `processOutbox` (every 10s) calls `anotar_no_prospecto`, or `obter_prospecto` followed by `mover_prospecto`. A move is applied only if the prospect is still in `fromStageId`, so prospects that already advanced never regress.
   - Auth errors leave items pending without spending attempts.
 
   Moving a prospect can trigger WatchTower automations (`cadastrar_cliente`, `criar_orcamento`). The panel warns about this, and `ensureDefaultStages` only auto-picks a target stage that has no automations.
+- **CNAE filter:** Receita-sourced prospects carry `origem` text, and "secundário" in it means the target CNAE is only secondary (usually consultancies, not accounting firms). `matchesCnae()` drives the import filter, which defaults to `principal`. `POST /campaigns/:id/watchtower-prune` removes non-matching *pending* messages (with `dryRun`) and backfills `{{origem}}` on contacts.
 - **`src/watchtower-map.ts`**: pure mapping from prospect to `ContactInput`. `cidade` is the text after " - " in the folder name. `scripts/mock-watchtower.ts` is a fake MCP server (token `mock-token`) for end-to-end tests without real CRM data.
 
 ### Data model notes
@@ -66,7 +69,7 @@ Node 24 runs `.ts` files directly using native type stripping. There is no compi
 
 ### Pure modules (unit-tested, no DB/env imports)
 
-`phone.ts`, `template.ts` (`{{var}}` placeholders plus nested `{a|b}` spintax; variable names are lowercased, stripped of accents, and spaces become `_`), `csv.ts` (detects `,` or `;`, handles quotes, also accepts a plain phone-per-line list), `schedule.ts`, and `optout.ts`. `config.ts` throws on import if required env vars are missing, so keep new testable logic out of modules that import `config`/`db`.
+`phone.ts`, `wa-map.ts`, `template.ts` (`{{var}}` placeholders plus nested `{a|b}` spintax; variable names are lowercased, stripped of accents, and spaces become `_`), `csv.ts` (detects `,` or `;`, handles quotes, also accepts a plain phone-per-line list), `schedule.ts`, and `optout.ts`. `config.ts` throws on import if required env vars are missing, so keep new testable logic out of modules that import `config`/`db`.
 
 ## Networking gotchas
 

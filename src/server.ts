@@ -7,6 +7,7 @@ import { migrate } from './db.ts';
 import { EvolutionError } from './evolution.ts';
 import { syncWebhooks } from './instances.ts';
 import { registerRoutes } from './routes.ts';
+import { startWaSync } from './wa-sync.ts';
 import { startOutbox } from './watchtower.ts';
 import { startWorker } from './worker.ts';
 
@@ -60,3 +61,4 @@ console.log(`[server] Prospecter em http://localhost:${config.port}`);
 })();
 startWorker();
 startOutbox();
+startWaSync();

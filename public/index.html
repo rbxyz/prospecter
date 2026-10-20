@@ -78,13 +78,21 @@
         <h4>Ao disparar</h4>
         <label id="wt-empresa-wrap" hidden>Empresa<select name="empresaId"></select></label>
         <label class="check"><input type="checkbox" name="annotateSends"> Anotar no histórico do prospecto cada mensagem enviada</label>
-        <label class="check"><input type="checkbox" name="moveOnReply"> Quando o contato responder, mover o prospecto de etapa</label>
+        <div class="row" style="align-items:center">
+          <label class="check"><input type="checkbox" name="moveEnabled"> Mover o prospecto de etapa</label>
+          <label>Quando
+            <select name="moveTrigger">
+              <option value="send">a mensagem for enviada</option>
+              <option value="reply">o contato responder</option>
+            </select>
+          </label>
+        </div>
         <div class="row">
           <label>Só se estiver em<select name="moveFromStageId"></select></label>
           <label>Mover para<select name="moveToStageId"></select></label>
         </div>
         <p class="hint" id="wt-stage-warning"></p>
-        <p class="hint">Quem responde "SAIR" é descadastrado e não muda de etapa. Prospectos que já avançaram no funil nunca voltam.</p>
+        <p class="hint">Só move quem ainda estiver na etapa de origem: prospectos que já avançaram no funil nunca voltam. Com "o contato responder", quem responde "SAIR" não muda de etapa.</p>
         <menu><button class="primary">Salvar</button></menu>
       </form>
 
@@ -112,6 +120,13 @@
           </select>
         </label>
       </div>
+      <label>CNAE (pela origem do prospecto)
+        <select name="cnae">
+          <option value="principal">Só CNAE principal (escritórios de contabilidade)</option>
+          <option value="secundario">Só CNAE secundário (consultorias e assessorias)</option>
+          <option value="todos">Todos</option>
+        </select>
+      </label>
       <label>Busca (nome, contato, e-mail ou documento)<input name="busca"></label>
       <fieldset>
         <legend>Pastas <small>(nenhuma marcada = todas)</small> <input id="wt-pasta-filter" placeholder="filtrar pastas…" style="width:auto"></legend>
@@ -125,6 +140,7 @@
       <div id="wt-import-result" class="result"></div>
       <menu>
         <button value="cancel" formnovalidate>Fechar</button>
+        <button value="prune" title="Tira da fila desta campanha quem não bate com o filtro de CNAE">Aplicar CNAE à fila</button>
         <button value="preview">Pré-visualizar</button>
         <button class="primary" value="import">Importar</button>
       </menu>
