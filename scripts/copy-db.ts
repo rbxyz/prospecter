@@ -20,6 +20,7 @@ const TABLES = [
   'watchtower_outbox',
   'wa_contacts',
   'wa_messages',
+  'cloud_events',
 ];
 
 const [fromUrl, toUrl] = process.argv.slice(2);

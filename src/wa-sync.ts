@@ -30,7 +30,7 @@ function chunks<T>(rows: T[]): T[][] {
   return out;
 }
 
-async function upsert(instance: string, contacts: WaContactRow[], messages: WaMessageRow[]): Promise<void> {
+export async function upsertWa(instance: string, contacts: WaContactRow[], messages: WaMessageRow[]): Promise<void> {
   for (const part of chunks(contacts)) {
     await sql`
       INSERT INTO wa_contacts ${sql(part.map((c) => ({ instance, ...c })))}
@@ -53,6 +53,7 @@ async function upsert(instance: string, contacts: WaContactRow[], messages: WaMe
         text = coalesce(EXCLUDED.text, wa_messages.text),
         push_name = coalesce(EXCLUDED.push_name, wa_messages.push_name),
         sent_at = coalesce(EXCLUDED.sent_at, wa_messages.sent_at),
+        origin = coalesce(wa_messages.origin, EXCLUDED.origin),
         synced_at = now()`;
   }
 }
@@ -61,7 +62,7 @@ async function upsert(instance: string, contacts: WaContactRow[], messages: WaMe
  * Completa o número das mensagens @lid com o que já se sabe do contato e liga contatos e mensagens
  * ao contato do Prospecter que tem aquele telefone (principal ou alternativo).
  */
-async function link(instance: string): Promise<number> {
+export async function linkWa(instance: string): Promise<number> {
   await sql`
     UPDATE wa_messages m SET phone = w.phone, phone_key = w.phone_key
     FROM wa_contacts w
@@ -96,8 +97,8 @@ async function syncInstance(instance: string): Promise<WaSyncResult> {
   const lidPhones = lidPhoneMap(evoMessages);
   const messages = evoMessages.map((m) => toWaMessage(m, lidPhones)).filter((m) => m !== null);
   const contacts = toWaContacts(evoContacts, messages, lidPhones);
-  await upsert(instance, contacts, messages);
-  const linked = await link(instance);
+  await upsertWa(instance, contacts, messages);
+  const linked = await linkWa(instance);
   return { instance, contacts: contacts.length, messages: messages.length, linked };
 }
 
@@ -125,8 +126,8 @@ export function syncWhatsApp(): Promise<WaSyncResult[]> {
 export async function recordWebhookMessages(instance: string, items: EvoMessage[]): Promise<void> {
   const messages = items.map((m) => toWaMessage(m)).filter((m) => m !== null);
   if (!instance || !messages.length) return;
-  await upsert(instance, toWaContacts([], messages), messages);
-  await link(instance);
+  await upsertWa(instance, toWaContacts([], messages), messages);
+  await linkWa(instance);
 }
 
 export function startWaSync(): void {

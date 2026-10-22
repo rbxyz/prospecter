@@ -2,6 +2,8 @@ import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import fastifyStatic from '@fastify/static';
 import Fastify from 'fastify';
+import { CloudError } from './cloud.ts';
+import { startCloudEvents } from './cloud-webhook.ts';
 import { config } from './config.ts';
 import { migrate } from './db.ts';
 import { EvolutionError } from './evolution.ts';
@@ -34,6 +36,9 @@ app.setErrorHandler((err, _req, reply) => {
   if (err instanceof EvolutionError) {
     return reply.code(502).send({ error: err.message, evolution: err.body });
   }
+  if (err instanceof CloudError) {
+    return reply.code(502).send({ error: err.message, meta: err.body });
+  }
   const error = err as Error & { statusCode?: number };
   const status = error.statusCode ?? 500;
   if (status >= 500) console.error(error);
@@ -41,7 +46,12 @@ app.setErrorHandler((err, _req, reply) => {
 });
 
 await migrate();
-await app.register(fastifyStatic, { root: fileURLToPath(new URL('../public/', import.meta.url)) });
+// no-cache: o navegador revalida (ETag) a cada carga, para o painel nunca ficar com JS/CSS antigo após um deploy.
+await app.register(fastifyStatic, {
+  root: fileURLToPath(new URL('../public/', import.meta.url)),
+  cacheControl: false,
+  setHeaders: (res) => res.header('cache-control', 'no-cache'),
+});
 await registerRoutes(app);
 await app.listen({ port: config.port, host: '0.0.0.0' });
 console.log(`[server] Prospecter em http://localhost:${config.port}`);
@@ -60,5 +70,6 @@ console.log(`[server] Prospecter em http://localhost:${config.port}`);
   console.error('[server] não foi possível sincronizar os webhooks com a Evolution API');
 })();
 startWorker();
+startCloudEvents();
 startOutbox();
 startWaSync();

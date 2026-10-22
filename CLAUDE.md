@@ -32,6 +32,11 @@ Node 24 runs `.ts` files directly using native type stripping. There is no compi
 - **`src/db.ts`**: postgres.js client. `migrate()` calls `runMigrations()` (`src/migrations.ts`, no config import so scripts can use it), which applies `src/migrations/*.sql` in filename order and tracks them in `schema_migrations`. To change the schema, add a new numbered file; never edit an applied one.
 - **Database location:** `APP_DATABASE_URL` (external Postgres, currently Neon) takes precedence over `DATABASE_URL` both on the host and in compose; Evolution keeps its own DB in the compose Postgres. `scripts/copy-db.ts <from> <to>` migrates the target and upserts every table by primary key in one transaction, preserving ids and resetting sequences; it is re-runnable. Add new tables to its `TABLES` list in FK order.
 - **WhatsApp conversation mirror (`src/wa-sync.ts`):** `syncWhatsApp()` pulls `/chat/findContacts` and every page of `/chat/findMessages` for each instance into `wa_contacts`/`wa_messages`, then fills `phone` on `@lid` rows and links `contact_id` via `phone_key = ANY(contacts.phone_keys)`. It runs 20s after startup, every 30 min, and on `POST /api/whatsapp/sync`; the webhook also records every `messages.upsert` item (both directions) before the reply handling. Row mapping is the pure `src/wa-map.ts` (also home of `extractText`/`senderPhone`). In sent messages `pushName` is our own name, so it is dropped.
+- **Read-only access for other systems:**
+  - Schema `leitura` (migration 007) has the views `numeros`, `conversas` and `mensagens` over `wa_messages`/`contacts`/`instances`. The views use owner rights, so they must never expose `access_token`.
+  - Role `prospecter_leitura` is created by `scripts/create-reader.ts`, which writes its URL to `.env.leitura` (gitignored). It only has `USAGE`/`SELECT` on `leitura` and connects with `default_transaction_read_only`.
+  - `instances.display_phone` holds the number for Evolution instances too. `rememberPhones()` fills it from `ownerJid` whenever Evolution is fetched.
+  - Changing the views means adding a new migration. Default privileges cover new views, so the role doesn't need to be recreated.
 - **`src/worker.ts`**: polling dispatcher that ticks every 3s. For each `running` campaign inside its time window, it picks an available instance and claims one `pending` message with `FOR UPDATE SKIP LOCKED`. An instance is available when it is connected (`open`), enabled, not busy, past its random delay, and under its daily limit. Sends run concurrently across instances but one at a time per instance. Per-instance pacing (`nextAvailableAt`, `busy`) is kept **in memory**, so this assumes a single app process. On startup, `sending` rows are reset to `pending`. Failed sends retry up to 3 attempts, then the message is marked `failed`. A campaign is set to `done` when nothing is left pending or sending.
 - **Random send times (`campaigns.random_times`, default on):**
   - For each (instance, campaign, day), `slotsFor()` draws `daily_limit - sentToday` random times between now and the end of the window (`planSlots`, spaced at least `delay_min_s` apart).
@@ -43,6 +48,27 @@ Node 24 runs `.ts` files directly using native type stripping. There is no compi
 - **`src/instances.ts`**: merges Evolution's `fetchInstances` with the local `instances` table (daily limit, enabled). Connection state is cached for 15s and also updated from the webhook. Instances created directly in Evolution are auto-registered locally.
 - **`src/evolution.ts`**: thin `fetch` client for the Evolution REST API (auth via `apikey` header). Errors become `EvolutionError`, which the server maps to HTTP 502.
 
+- **Two kinds of number (`instances.provider`):** `evolution` (Baileys via QR, free-text spintax) and `cloud` (Meta Cloud API in Coexistence/Coex, approved templates only). A campaign has one `provider`, and the worker only uses numbers with that provider. For `cloud`, a number must also belong to the same WABA as `campaigns.cloud_template.waba_id`. Connection is checked by `isConnected()` in `instances.ts`: Evolution state for QR numbers, `cloud_status = 'connected'` for Coex numbers. Use it in both `tick()` and `waitingReasons()`.
+- **Cloud API (Coex):**
+  - The app doesn't do onboarding (Embedded Signup needs a Tech Provider). `POST /api/instances/cloud` registers an already-connected number from its phone_number_id, WABA id and system-user token (`instances.access_token`, never sent to the panel).
+  - `src/cloud.ts` is the Graph client; `CloudError.code` is Meta's error code.
+  - `src/cloud-map.ts` is pure: `renderCloud()` is the send-time gate for templates, like `renderChecked`. Each template variable maps to an expression in our template syntax. It also has `classifyCloudError()` and `parseCloudWebhook()`.
+  - Send errors:
+    - 131026 → `invalid`.
+    - 131049 → `failed`, not retried.
+    - 132xxx → pauses the campaign.
+    - Account errors (190, 131042…) → `cloud_status = 'error'`; the message is requeued without spending an attempt.
+  - There is no "has WhatsApp?" check and no alt-phone fallback.
+- **Meta webhook (`/webhook/meta`):**
+  - The route lives in its own Fastify scope with a raw-buffer JSON parser so `x-hub-signature-256` (HMAC with `META_APP_SECRET`) can be checked.
+  - Payloads are stored in `cloud_events` and answered with 200 right away. `src/cloud-webhook.ts` processes them every 5s, up to 5 attempts.
+  - Every Cloud API message goes into `wa_messages` with an `origin`: `api`, `app` (smb_message_echoes), `history` or `contact`. The worker records its own API sends, since Meta doesn't echo them.
+  - Live inbound messages go through `handleReply()` in `webhook.ts`, which is shared with Evolution. They are deduped by wamid, and echoes never count as replies.
+  - Safety stops:
+    - `account_update` PARTNER_REMOVED → `disconnected`.
+    - Quality FLAGGED/DOWNGRADE → `enabled = false`.
+    - Template PAUSED/DISABLED → pauses the campaigns that use it.
+  - The history sync (`smb_app_data`) can only be requested once (`history_sync_at`).
 - **`src/watchtower.ts`**: MCP client (`@modelcontextprotocol/sdk`, Streamable HTTP) for the WatchTower CRM. It supports two auth modes:
   - **OAuth** (default): `DbOAuthProvider` persists the client registration, tokens, PKCE verifier, and state in the `kv` table. `auth()` captures the authorization URL in `redirectToAuthorization`, and the panel opens it in a popup. The browser returns to `PUBLIC_URL/integrations/watchtower/callback`.
   - **Static Bearer token**, when `WATCHTOWER_MCP_TOKEN` is set.
@@ -69,7 +95,7 @@ Node 24 runs `.ts` files directly using native type stripping. There is no compi
 
 ### Pure modules (unit-tested, no DB/env imports)
 
-`phone.ts`, `wa-map.ts`, `template.ts` (`{{var}}` placeholders plus nested `{a|b}` spintax; variable names are lowercased, stripped of accents, and spaces become `_`), `csv.ts` (detects `,` or `;`, handles quotes, also accepts a plain phone-per-line list), `schedule.ts`, and `optout.ts`. `config.ts` throws on import if required env vars are missing, so keep new testable logic out of modules that import `config`/`db`.
+`phone.ts`, `wa-map.ts`, `cloud-map.ts`, `template.ts` (`{{var}}` placeholders plus nested `{a|b}` spintax; variable names are lowercased, stripped of accents, and spaces become `_`), `csv.ts` (detects `,` or `;`, handles quotes, also accepts a plain phone-per-line list), `schedule.ts`, and `optout.ts`. `config.ts` throws on import if required env vars are missing, so keep new testable logic out of modules that import `config`/`db`.
 
 ## Networking gotchas
 

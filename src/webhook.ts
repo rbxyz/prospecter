@@ -40,7 +40,23 @@ async function handleIncoming(instance: string, item: EvoMessage): Promise<void>
 
   const phone = senderPhone(key);
   if (!phone) return;
-  const text = extractText(item.message);
+  await handleReply(instance, phone, item.pushName ?? null, extractText(item.message), (text) =>
+    evolution.sendText(instance, phone, text, 1500),
+  );
+}
+
+/**
+ * Resposta de um contato, venha da Evolution ou da Cloud API: registra, marca a mensagem como
+ * respondida, move no WatchTower (se configurado) e trata o pedido para sair.
+ * `sendReply` envia a resposta automática de descadastro pelo mesmo canal.
+ */
+export async function handleReply(
+  instance: string,
+  phone: string,
+  pushName: string | null,
+  text: string,
+  sendReply: (text: string) => Promise<unknown>,
+): Promise<void> {
   const optOut = isOptOut(text, config.optOut.keywords);
 
   const [contact] = await sql<
@@ -53,7 +69,7 @@ async function handleIncoming(instance: string, item: EvoMessage): Promise<void>
 
   await sql`
     INSERT INTO inbound (instance, contact_id, phone, push_name, text, opt_out)
-    VALUES (${instance}, ${contact?.id ?? null}, ${phone}, ${item.pushName ?? null}, ${text}, ${optOut})`;
+    VALUES (${instance}, ${contact?.id ?? null}, ${phone}, ${pushName}, ${text}, ${optOut})`;
 
   if (!contact) return;
 
@@ -78,10 +94,8 @@ async function handleIncoming(instance: string, item: EvoMessage): Promise<void>
     await optOutContact(contact.id);
     console.log(`[webhook] ${phone} pediu para sair da lista`);
     if (config.optOut.reply && instance) {
-      // Sem await: o webhook precisa responder rápido para a Evolution.
-      evolution
-        .sendText(instance, phone, config.optOut.reply, 1500)
-        .catch((err) => console.warn('[webhook] falha ao responder descadastro:', (err as Error).message));
+      // Sem await: o webhook precisa responder rápido.
+      sendReply(config.optOut.reply).catch((err) => console.warn('[webhook] falha ao responder descadastro:', (err as Error).message));
     }
   }
 }
