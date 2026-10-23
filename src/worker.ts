@@ -1,11 +1,24 @@
+import { cloud, CloudError } from './cloud.ts';
+import { classifyCloudError, renderCloud, type CloudTemplate, type CloudWaRow } from './cloud-map.ts';
 import { config } from './config.ts';
 import { sql } from './db.ts';
-import { evolution, EvolutionError } from './evolution.ts';
-import { evolutionInstances, sentTodayByInstance, setCachedState } from './instances.ts';
+import { evolution, EvolutionError, type EvolutionInstance } from './evolution.ts';
+import {
+  cloudCredentials,
+  evolutionInstances,
+  isConnected,
+  sentTodayByInstance,
+  setCachedState,
+  setCloudStatus,
+  type LocalInstance,
+  type Provider,
+} from './instances.ts';
 import { jidToPhone, phoneKey } from './phone.ts';
 import { currentWindowEnd, isWithinWindow, localDayKey, nextWindowStart, planSlots, randomBetween } from './schedule.ts';
 import { contactVars, renderChecked } from './template.ts';
-import { enqueueNote, getSettings } from './watchtower.ts';
+import { toWaContacts } from './wa-map.ts';
+import { linkWa, upsertWa } from './wa-sync.ts';
+import { enqueueMove, enqueueNote, getSettings } from './watchtower.ts';
 
 const TICK_MS = 3_000;
 const MAX_ATTEMPTS = 3;
@@ -23,7 +36,19 @@ export interface Campaign {
   weekdays: number[];
   skip_replied: boolean;
   random_times: boolean;
+  /** evolution = texto livre pelo QR; cloud = template aprovado pela Cloud API (Coex). */
+  provider: Provider;
+  cloud_template: CloudTemplate | null;
 }
+
+/** O número serve para a campanha: mesmo canal e, na Cloud API, a WABA onde o template existe. */
+function fitsCampaign(campaign: Campaign, i: Pick<LocalInstance, 'provider' | 'waba_id'>): boolean {
+  if (i.provider !== campaign.provider) return false;
+  return campaign.provider !== 'cloud' || i.waba_id === campaign.cloud_template?.waba_id;
+}
+
+/** Estado da Evolution; fora do ar, as campanhas da Cloud API continuam rodando. */
+const remoteOrEmpty = () => evolutionInstances().catch(() => new Map<string, EvolutionInstance>());
 
 interface QueuedMessage {
   id: number;
@@ -92,14 +117,14 @@ async function tick(): Promise<void> {
     if (campaigns.length === 0) return;
 
     const [remote, sentToday, local] = await Promise.all([
-      evolutionInstances(),
+      remoteOrEmpty(),
       sentTodayByInstance(),
-      sql<{ name: string; daily_limit: number }[]>`SELECT name, daily_limit FROM instances WHERE enabled`,
+      sql<LocalInstance[]>`SELECT name, daily_limit, enabled, provider, cloud_status, waba_id FROM instances WHERE enabled`,
     ]);
     const now = Date.now();
     const available = local.filter(
       (i) =>
-        remote.get(i.name)?.connectionStatus === 'open' &&
+        isConnected(i, remote) &&
         !busy.has(i.name) &&
         (nextAvailableAt.get(i.name) ?? 0) <= now &&
         (sentToday.get(i.name) ?? 0) < i.daily_limit,
@@ -111,6 +136,7 @@ async function tick(): Promise<void> {
       const candidates = available.filter(
         (i) =>
           !busy.has(i.name) &&
+          fitsCampaign(campaign, i) &&
           (!allowed || allowed.has(i.name)) &&
           (!campaign.random_times ||
             (slotsFor(campaign, i, sentToday.get(i.name) ?? 0, new Date(now))[0] ?? Infinity) <= now),
@@ -160,20 +186,23 @@ export async function waitingReasons(campaigns: Campaign[]): Promise<Map<string,
   const running = campaigns.filter((c) => c.status === 'running');
   if (running.length === 0) return reasons;
 
-  let remote: Awaited<ReturnType<typeof evolutionInstances>>;
+  let remote: Awaited<ReturnType<typeof evolutionInstances>> | null = null;
   try {
     remote = await evolutionInstances();
   } catch {
-    for (const c of running) reasons.set(String(c.id), 'Evolution API indisponível');
-    return reasons;
+    // Só as campanhas pela Evolution ficam paradas.
   }
   const [sentToday, local] = await Promise.all([
     sentTodayByInstance(),
-    sql<{ name: string; daily_limit: number; enabled: boolean }[]>`SELECT name, daily_limit, enabled FROM instances`,
+    sql<LocalInstance[]>`SELECT name, daily_limit, enabled, provider, cloud_status, waba_id FROM instances`,
   ]);
 
   const now = new Date();
   for (const c of running) {
+    if (c.provider === 'evolution' && !remote) {
+      reasons.set(String(c.id), 'Evolution API indisponível');
+      continue;
+    }
     if (!isWithinWindow(c, now, config.timezone)) {
       const next = nextWindowStart(c, now, config.timezone);
       reasons.set(
@@ -182,10 +211,15 @@ export async function waitingReasons(campaigns: Campaign[]): Promise<Map<string,
       );
       continue;
     }
-    const allowed = local.filter((i) => !c.instances.length || c.instances.includes(i.name));
-    const usable = allowed.filter((i) => i.enabled && remote.get(i.name)?.connectionStatus === 'open');
+    const allowed = local.filter((i) => fitsCampaign(c, i) && (!c.instances.length || c.instances.includes(i.name)));
+    const usable = allowed.filter((i) => i.enabled && isConnected(i, remote ?? new Map()));
     if (usable.length === 0) {
-      reasons.set(String(c.id), 'Nenhum número conectado e habilitado para esta campanha');
+      reasons.set(
+        String(c.id),
+        c.provider === 'cloud'
+          ? 'Nenhum número da Cloud API (Coex) conectado e habilitado na WABA do template'
+          : 'Nenhum número conectado e habilitado para esta campanha',
+      );
       continue;
     }
     if (usable.every((i) => (sentToday.get(i.name) ?? 0) >= i.daily_limit)) {
@@ -246,6 +280,25 @@ async function markSkipped(id: number, reason: string, status: 'skipped' | 'inva
   return false;
 }
 
+/** Após um envio: anota no histórico do prospecto e, se configurado, muda a etapa (ex.: Novo → Iniciado atendimento). */
+async function recordInWatchtower(prospectId: string, campaign: Campaign, from: string, number: string, text: string): Promise<void> {
+  try {
+    const wt = await getSettings();
+    if (wt.annotateSends) {
+      const via = campaign.provider === 'cloud' ? ', pela Cloud API' : '';
+      await enqueueNote(
+        prospectId,
+        `Prospecter: mensagem enviada por WhatsApp para ${number} (número ${from}${via}, campanha "${campaign.name}").\n\n${text}`,
+      );
+    }
+    if (wt.moveEnabled && wt.moveTrigger === 'send' && wt.moveFromStageId && wt.moveToStageId) {
+      await enqueueMove(prospectId, wt.moveFromStageId, wt.moveToStageId);
+    }
+  } catch (err) {
+    console.warn('[worker] falha ao enfileirar escrita no WatchTower:', (err as Error).message);
+  }
+}
+
 /** Primeiro telefone da lista (na ordem dada) que tem WhatsApp, já no formato do JID. */
 async function pickWhatsappNumber(instance: string, phones: string[]): Promise<string | null> {
   const results = await evolution.whatsappNumbers(instance, phones);
@@ -257,10 +310,21 @@ async function pickWhatsappNumber(instance: string, phones: string[]): Promise<s
   return valid[0] ?? null;
 }
 
+/** Falha que pode ser tentada de novo: volta para a fila até MAX_ATTEMPTS. */
+async function failAttempt(campaign: Campaign, msg: QueuedMessage, instance: string, error: string): Promise<true> {
+  const status = msg.attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+  await sql`
+    UPDATE messages SET status = ${status}, error = ${error}, instance = NULL
+    WHERE id = ${msg.id}`;
+  console.warn(`[worker] campanha ${campaign.id}: falha ao enviar para ${msg.phone} via ${instance}: ${error}`);
+  return true;
+}
+
 /** Retorna true quando o número de fato enviou (ou tentou enviar) uma mensagem. */
 async function send(campaign: Campaign, msg: QueuedMessage, instance: string): Promise<boolean> {
   if (msg.opted_out_at) return markSkipped(msg.id, 'contato pediu para sair');
   if (campaign.skip_replied && msg.last_reply_at) return markSkipped(msg.id, 'contato já respondeu antes');
+  if (campaign.provider === 'cloud') return sendCloud(campaign, msg, instance);
 
   // Validação final: nunca envia com variável vazia ou marcação de template sobrando no texto.
   const { text, problems } = renderChecked(campaign.template, contactVars(msg));
@@ -285,13 +349,9 @@ async function send(campaign: Campaign, msg: QueuedMessage, instance: string): P
       WHERE id = ${msg.id}`;
     console.log(`[worker] campanha ${campaign.id}: enviado para ${number} via ${instance}`);
 
-    if (msg.wt_prospect_id && (await getSettings()).annotateSends) {
-      const sender = (await evolutionInstances()).get(instance);
-      const from = jidToPhone(sender?.ownerJid) ?? instance;
-      await enqueueNote(
-        msg.wt_prospect_id,
-        `Prospecter: mensagem enviada por WhatsApp para ${number} (número ${from}, campanha "${campaign.name}").\n\n${text}`,
-      ).catch((err) => console.warn('[worker] falha ao enfileirar anotação no WatchTower:', err.message));
+    if (msg.wt_prospect_id) {
+      const from = jidToPhone((await evolutionInstances()).get(instance)?.ownerJid) ?? instance;
+      await recordInWatchtower(msg.wt_prospect_id, campaign, from, number, text);
     }
     return true;
   } catch (err) {
@@ -299,11 +359,86 @@ async function send(campaign: Campaign, msg: QueuedMessage, instance: string): P
     if (err instanceof EvolutionError && (err.status === 404 || /connection closed|not connected/i.test(error))) {
       setCachedState(instance, 'close');
     }
-    const status = msg.attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+    return failAttempt(campaign, msg, instance, error);
+  }
+}
+
+/**
+ * Envio pela Cloud API (Coex): template aprovado com as variáveis do contato.
+ * A Cloud API não tem consulta de "tem WhatsApp?": vai para o telefone principal e, se não houver
+ * WhatsApp, a Meta devolve 131026 (na hora ou pelo webhook de status) e a mensagem vira "invalid".
+ */
+async function sendCloud(campaign: Campaign, msg: QueuedMessage, instance: string): Promise<boolean> {
+  const t = campaign.cloud_template;
+  if (!t) return markSkipped(msg.id, 'bloqueada: campanha sem template da Cloud API', 'blocked');
+  const { text, parameters, problems } = renderCloud(t, contactVars(msg));
+  if (problems.length) return markSkipped(msg.id, `bloqueada: ${problems.join('; ')}`, 'blocked');
+
+  const creds = await cloudCredentials(instance);
+  if (!creds) return failAttempt(campaign, msg, instance, 'número da Cloud API não encontrado');
+
+  await sql`UPDATE messages SET instance = ${instance} WHERE id = ${msg.id}`;
+  const number = msg.phone;
+  try {
+    const res = await cloud.sendTemplate(creds.access_token, creds.phone_number_id, number, t, parameters);
+    const waId = res.messages?.[0]?.id ?? null;
     await sql`
-      UPDATE messages SET status = ${status}, error = ${error}, instance = NULL
+      UPDATE messages
+      SET status = 'sent', text = ${text}, to_phone = ${number}, sent_at = now(), wa_message_id = ${waId}, error = NULL
       WHERE id = ${msg.id}`;
-    console.warn(`[worker] campanha ${campaign.id}: falha ao enviar para ${msg.phone} via ${instance}: ${error}`);
+    console.log(`[worker] campanha ${campaign.id}: template "${t.name}" enviado para ${number} via ${instance} (Cloud API)`);
+
+    // A Meta não ecoa o que sai pela API: o espelho de conversas registra aqui, com origem "api".
+    if (waId) {
+      const row: CloudWaRow = {
+        wa_id: waId,
+        jid: `${number}@s.whatsapp.net`,
+        phone: number,
+        phone_key: phoneKey(number),
+        from_me: true,
+        type: 'template',
+        text,
+        push_name: null,
+        sent_at: new Date(),
+        origin: 'api',
+      };
+      await upsertWa(instance, toWaContacts([], [row]), [row])
+        .then(() => linkWa(instance))
+        .catch((err) => console.warn('[worker] falha ao espelhar envio da Cloud API:', (err as Error).message));
+    }
+
+    if (msg.wt_prospect_id) await recordInWatchtower(msg.wt_prospect_id, campaign, creds.display_phone ?? instance, number, text);
     return true;
+  } catch (err) {
+    const error = (err as Error).message.slice(0, 500);
+    if (!(err instanceof CloudError)) return failAttempt(campaign, msg, instance, error);
+
+    switch (classifyCloudError(err.code)) {
+      case 'invalid':
+        await markSkipped(msg.id, 'número sem WhatsApp (131026)', 'invalid');
+        return true;
+      case 'user-limit':
+        await sql`
+          UPDATE messages SET status = 'failed', instance = NULL,
+            error = 'limite diário de marketing deste contato na Meta (131049): não retentar hoje'
+          WHERE id = ${msg.id}`;
+        return true;
+      case 'template':
+        // Template sumiu, foi pausado ou os parâmetros não batem: todos os próximos falhariam igual.
+        await sql`UPDATE messages SET status = 'failed', error = ${error}, instance = NULL WHERE id = ${msg.id}`;
+        await sql`UPDATE campaigns SET status = 'paused' WHERE id = ${campaign.id} AND status = 'running'`;
+        console.warn(`[worker] campanha ${campaign.id} pausada: problema no template "${t.name}": ${error}`);
+        return true;
+      case 'account':
+        // Token, pagamento ou conta: o problema é do número, não do contato. Não gasta tentativa.
+        await setCloudStatus(instance, 'error', error);
+        await sql`
+          UPDATE messages SET status = 'pending', attempts = greatest(attempts - 1, 0), error = ${error}, instance = NULL
+          WHERE id = ${msg.id}`;
+        console.warn(`[worker] ${instance} tirado dos disparos: ${error}`);
+        return true;
+      default:
+        return failAttempt(campaign, msg, instance, error);
+    }
   }
 }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { parsePhoneList } from '../src/phone.ts';
 import { prettyName } from '../src/template.ts';
-import { parseToolText, prospectToContact, type WtProspect } from '../src/watchtower-map.ts';
+import { isSecondaryCnae, matchesCnae, parseToolText, prospectToContact, type WtProspect } from '../src/watchtower-map.ts';
 
 test('parsePhoneList separa vários telefones e põe celulares primeiro', () => {
   assert.deepEqual(parsePhoneList('(51) 3714-1234 / (51) 99876-5432'), ['5551998765432', '555137141234']);
@@ -55,4 +55,17 @@ test('parseToolText lê o JSON do primeiro bloco e ignora avisos', () => {
   ];
   assert.deepEqual(parseToolText(content), [{ id: '1' }]);
   assert.equal(parseToolText([{ type: 'text', text: 'erro qualquer' }]), 'erro qualquer');
+});
+
+test('filtro de CNAE pela origem do prospecto', () => {
+  const sec = { origem: 'Receita Federal - CNAE 6920 secundário (prospecção regional out/2026)' };
+  const pri = { origem: 'Receita Federal - CNAE 6920 (prospecção regional out/2026)' };
+  const none = { origem: null };
+  assert.equal(isSecondaryCnae(sec), true);
+  assert.equal(isSecondaryCnae({ origem: 'CNAE secundario' }), true);
+  assert.equal(isSecondaryCnae(pri), false);
+  assert.equal(isSecondaryCnae(none), false);
+  assert.deepEqual([sec, pri, none].map((p) => matchesCnae(p, 'principal')), [false, true, true]);
+  assert.deepEqual([sec, pri, none].map((p) => matchesCnae(p, 'secundario')), [true, false, false]);
+  assert.deepEqual([sec, pri, none].map((p) => matchesCnae(p, 'todos')), [true, true, true]);
 });

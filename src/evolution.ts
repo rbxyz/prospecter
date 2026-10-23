@@ -1,4 +1,5 @@
 import { config } from './config.ts';
+import type { EvoContact, EvoMessage } from './wa-map.ts';
 
 export class EvolutionError extends Error {
   readonly status: number;
@@ -98,6 +99,18 @@ export const evolution = {
       'POST',
       `/chat/whatsappNumbers/${enc(instanceName)}`,
       { numbers },
+    ),
+
+  /** Contatos que a Evolution guardou da instância (funciona mesmo com o número desconectado). */
+  findContacts: (instanceName: string) =>
+    request<EvoContact[]>('POST', `/chat/findContacts/${enc(instanceName)}`, { where: {} }),
+
+  /** Uma página das mensagens guardadas da instância (enviadas e recebidas). */
+  findMessages: (instanceName: string, page: number, pageSize: number) =>
+    request<{ messages: { total: number; pages: number; currentPage: number; records: EvoMessage[] } }>(
+      'POST',
+      `/chat/findMessages/${enc(instanceName)}`,
+      { where: {}, page, offset: pageSize },
     ),
 
   /** `delay` (ms) mostra "digitando..." antes de enviar. */

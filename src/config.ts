@@ -14,7 +14,8 @@ function list(name: string, fallback: string): string[] {
 export const config = {
   port: Number(process.env.PORT ?? 3000),
   timezone: process.env.TZ ?? 'America/Sao_Paulo',
-  databaseUrl: required('DATABASE_URL'),
+  /** APP_DATABASE_URL (banco externo, ex.: Neon) tem prioridade sobre o Postgres local/do compose. */
+  databaseUrl: process.env.APP_DATABASE_URL || required('DATABASE_URL'),
   evolution: {
     url: required('EVOLUTION_URL').replace(/\/+$/, ''),
     apiKey: required('EVOLUTION_API_KEY'),
@@ -30,6 +31,14 @@ export const config = {
     url: process.env.WATCHTOWER_MCP_URL ?? '',
     /** Opcional: token Bearer fixo. Sem ele, a conexão usa OAuth pelo painel. */
     token: process.env.WATCHTOWER_MCP_TOKEN ?? '',
+  },
+  /** Cloud API da Meta (números em Coexistência). Sem appSecret, o webhook /webhook/meta recusa tudo. */
+  meta: {
+    graphVersion: process.env.META_GRAPH_VERSION || 'v24.0',
+    /** Segredo do app na Meta: confere a assinatura x-hub-signature-256 de cada webhook. */
+    appSecret: process.env.META_APP_SECRET ?? '',
+    /** Token escolhido por você e informado na Meta ao cadastrar a URL do webhook. */
+    verifyToken: process.env.META_VERIFY_TOKEN ?? '',
   },
   optOut: {
     keywords: list('OPT_OUT_KEYWORDS', 'sair,parar,pare,stop,cancelar,descadastrar,remover'),

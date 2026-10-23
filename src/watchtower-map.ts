@@ -13,6 +13,23 @@ export interface WtProspect {
   etapaNome: string | null;
   pastaNome: string | null;
   responsavelNome: string | null;
+  origem?: string | null;
+}
+
+export type CnaeFilter = 'todos' | 'principal' | 'secundario';
+
+/**
+ * As bases da Receita marcam na origem quando o CNAE buscado é só secundário
+ * ("Receita Federal - CNAE 6920 secundário (...)"). Nesses casos a empresa costuma ser
+ * consultoria/assessoria, não escritório de contabilidade. Sem origem conta como principal.
+ */
+export function isSecondaryCnae(p: Pick<WtProspect, 'origem'>): boolean {
+  return /secund[aá]ri/i.test(p.origem ?? '');
+}
+
+export function matchesCnae(p: Pick<WtProspect, 'origem'>, filter: CnaeFilter | undefined): boolean {
+  if (!filter || filter === 'todos') return true;
+  return filter === 'secundario' ? isSecondaryCnae(p) : !isSecondaryCnae(p);
 }
 
 /**
@@ -39,6 +56,7 @@ export function prospectToContact(p: WtProspect): ContactInput {
       cidade,
       etapa: p.etapaNome ?? '',
       responsavel: p.responsavelNome ?? '',
+      origem: p.origem ?? '',
     },
   };
 }

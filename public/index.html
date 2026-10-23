@@ -12,6 +12,8 @@
     <nav>
       <button class="tab active" data-tab="campaigns">Campanhas</button>
       <button class="tab" data-tab="instances">Números</button>
+      <button class="tab" data-tab="coex">Coex · Cloud API <span id="coex-dot" class="dot" hidden></span></button>
+      <button class="tab" data-tab="conversations">Conversas</button>
       <button class="tab" data-tab="inbound">Respostas</button>
       <button class="tab" data-tab="optouts">Descadastrados</button>
       <button class="tab" data-tab="watchtower">WatchTower</button>
@@ -32,13 +34,86 @@
     <section id="tab-instances" class="panel" hidden>
       <div class="toolbar">
         <h2>Números de prospecção</h2>
-        <form id="form-new-instance" class="inline">
-          <input name="name" placeholder="nome-do-numero (ex.: vendas-01)" required pattern="[a-zA-Z0-9_\-]{2,40}">
-          <button class="primary">+ Adicionar número</button>
-        </form>
+        <div class="toolbar-actions">
+          <form id="form-new-instance" class="inline">
+            <input name="name" placeholder="nome-do-numero (ex.: vendas-01)" required pattern="[a-zA-Z0-9_\-]{2,40}">
+            <button class="primary">+ Número QR Code</button>
+          </form>
+          <button data-open-cloud>+ Número Coex</button>
+        </div>
       </div>
-      <p class="hint">Cada número é uma instância da Evolution API. Conecte lendo o QR Code no WhatsApp do celular (Aparelhos conectados → Conectar um aparelho).</p>
+      <div class="kinds">
+        <div class="kind">
+          <b>QR Code (Evolution)</b>
+          <span>Conecta como aparelho do WhatsApp. Dispara texto livre com variações; sem custo por mensagem.</span>
+        </div>
+        <div class="kind">
+          <b>Coex (Cloud API da Meta)</b>
+          <span>O número continua no WhatsApp Business do celular. Dispara só templates aprovados (cobrados por entrega); as respostas seguem no celular.</span>
+        </div>
+      </div>
       <div id="instance-list" class="grid"></div>
+    </section>
+
+    <!-- Coex (Cloud API) -->
+    <section id="tab-coex" class="panel" hidden>
+      <div class="toolbar">
+        <h2>Coex · WhatsApp Cloud API</h2>
+        <div class="toolbar-actions">
+          <button id="btn-coex-refresh">Atualizar</button>
+          <button class="primary" data-open-cloud>+ Adicionar número Coex</button>
+        </div>
+      </div>
+
+      <div class="two-col">
+        <div class="card">
+          <h4>Configuração</h4>
+          <ol id="coex-steps" class="steps"></ol>
+        </div>
+        <div class="card">
+          <header><h4>Webhooks da Meta</h4><span id="coex-events-badge" class="badge"></span></header>
+          <div id="coex-events" class="stats"></div>
+          <div id="coex-failures" class="hint"></div>
+          <div class="actions" id="coex-events-actions"></div>
+          <h4 style="margin-top:16px">Assinar na Meta</h4>
+          <p class="hint">App Dashboard → WhatsApp → Configuration → Webhook fields:</p>
+          <div class="chips" id="coex-fields"></div>
+          <div class="actions"><button data-copy="fields">Copiar lista de campos</button></div>
+        </div>
+      </div>
+
+      <h3 class="section-title">Números Coex</h3>
+      <div id="coex-numbers" class="grid"></div>
+
+      <div class="toolbar section-title">
+        <h3>Templates aprovados</h3>
+        <button id="btn-templates-refresh">Recarregar da Meta</button>
+      </div>
+      <p class="hint">O primeiro contato pela API é sempre um template. O Prospecter preenche as variáveis do corpo; cabeçalho com mídia ou variável e botão com URL variável não são suportados.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Template</th><th>Categoria</th><th>Status</th><th>Corpo</th><th></th></tr></thead>
+        <tbody id="template-list"></tbody>
+      </table></div>
+    </section>
+
+    <!-- Conversas -->
+    <section id="tab-conversations" class="panel" hidden>
+      <div class="toolbar">
+        <h2>Conversas</h2>
+        <div class="toolbar-actions">
+          <input id="conv-search" type="search" placeholder="Buscar por nome, empresa ou telefone">
+          <button id="btn-wa-sync">Sincronizar agora</button>
+        </div>
+      </div>
+      <p class="hint">
+        Espelho de tudo que foi falado em cada número: campanhas, o que você mandou pelo celular e as respostas.
+        Os números QR Code sincronizam a cada 30 min; os Coex chegam na hora pelos webhooks.
+      </p>
+      <div id="conv-sync-result" class="hint"></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Última</th><th>Contato</th><th>Telefone</th><th>Número</th><th>Enviadas</th><th>Recebidas</th><th>Última mensagem</th></tr></thead>
+        <tbody id="conv-list"></tbody>
+      </table></div>
     </section>
 
     <!-- Respostas -->
@@ -78,13 +153,21 @@
         <h4>Ao disparar</h4>
         <label id="wt-empresa-wrap" hidden>Empresa<select name="empresaId"></select></label>
         <label class="check"><input type="checkbox" name="annotateSends"> Anotar no histórico do prospecto cada mensagem enviada</label>
-        <label class="check"><input type="checkbox" name="moveOnReply"> Quando o contato responder, mover o prospecto de etapa</label>
+        <div class="row" style="align-items:center">
+          <label class="check"><input type="checkbox" name="moveEnabled"> Mover o prospecto de etapa</label>
+          <label>Quando
+            <select name="moveTrigger">
+              <option value="send">a mensagem for enviada</option>
+              <option value="reply">o contato responder</option>
+            </select>
+          </label>
+        </div>
         <div class="row">
           <label>Só se estiver em<select name="moveFromStageId"></select></label>
           <label>Mover para<select name="moveToStageId"></select></label>
         </div>
         <p class="hint" id="wt-stage-warning"></p>
-        <p class="hint">Quem responde "SAIR" é descadastrado e não muda de etapa. Prospectos que já avançaram no funil nunca voltam.</p>
+        <p class="hint">Só move quem ainda estiver na etapa de origem: prospectos que já avançaram no funil nunca voltam. Com "o contato responder", quem responde "SAIR" não muda de etapa.</p>
         <menu><button class="primary">Salvar</button></menu>
       </form>
 
@@ -112,6 +195,13 @@
           </select>
         </label>
       </div>
+      <label>CNAE (pela origem do prospecto)
+        <select name="cnae">
+          <option value="principal">Só CNAE principal (escritórios de contabilidade)</option>
+          <option value="secundario">Só CNAE secundário (consultorias e assessorias)</option>
+          <option value="todos">Todos</option>
+        </select>
+      </label>
       <label>Busca (nome, contato, e-mail ou documento)<input name="busca"></label>
       <fieldset>
         <legend>Pastas <small>(nenhuma marcada = todas)</small> <input id="wt-pasta-filter" placeholder="filtrar pastas…" style="width:auto"></legend>
@@ -125,6 +215,7 @@
       <div id="wt-import-result" class="result"></div>
       <menu>
         <button value="cancel" formnovalidate>Fechar</button>
+        <button value="prune" title="Tira da fila desta campanha quem não bate com o filtro de CNAE">Aplicar CNAE à fila</button>
         <button value="preview">Pré-visualizar</button>
         <button class="primary" value="import">Importar</button>
       </menu>
@@ -137,13 +228,35 @@
       <h3 id="campaign-form-title">Nova campanha</h3>
       <input type="hidden" name="id">
       <label>Nome<input name="name" required></label>
-      <label>Mensagem
-        <textarea name="template" rows="6" required placeholder="{Oi|Olá} {{primeiro_nome}}, tudo bem? ..."></textarea>
-      </label>
-      <p class="hint">
-        Variáveis: <code>{{nome}}</code> <code>{{primeiro_nome}}</code> <code>{{telefone}}</code> e qualquer coluna do CSV (ex.: <code>{{empresa}}</code>).
-        Variações aleatórias: <code>{Oi|Olá|E aí}</code> — ajudam a não enviar textos idênticos.
-      </p>
+      <fieldset class="seg">
+        <legend>Canal</legend>
+        <label><input type="radio" name="provider" value="evolution" checked>
+          <span><b>QR Code</b><small>Texto livre com variações, sem custo por mensagem</small></span></label>
+        <label><input type="radio" name="provider" value="cloud">
+          <span><b>Coex · Cloud API</b><small>Template aprovado pela Meta, cobrado por entrega</small></span></label>
+      </fieldset>
+
+      <div id="campaign-evolution">
+        <label>Mensagem
+          <textarea name="template" rows="6" placeholder="{Oi|Olá} {{primeiro_nome}}, tudo bem? ..."></textarea>
+        </label>
+        <p class="hint">
+          Variáveis: <code>{{nome}}</code> <code>{{primeiro_nome}}</code> <code>{{telefone}}</code> e qualquer coluna do CSV (ex.: <code>{{empresa}}</code>).
+          Variações aleatórias: <code>{Oi|Olá|E aí}</code> — ajudam a não enviar textos idênticos.
+        </p>
+      </div>
+
+      <div id="campaign-cloud" hidden>
+        <label>Template aprovado<select name="cloudTemplate"></select></label>
+        <div id="cloud-template-empty" class="waiting" hidden></div>
+        <pre id="cloud-template-body" class="template-body" hidden></pre>
+        <div id="cloud-template-params" class="params"></div>
+        <p class="hint">
+          Cada variável do template recebe um valor com as variáveis do contato (ex.: <code>{{primeiro_nome}}</code>, <code>{{empresa}}</code>)
+          e pode ter variações <code>{a|b}</code>, sem quebra de linha. Contato com variável vazia fica "Bloqueado" e não recebe.
+        </p>
+      </div>
+
       <div class="preview" id="campaign-preview"></div>
       <button type="button" id="btn-preview">Pré-visualizar</button>
 
@@ -240,6 +353,43 @@
         <button value="cancel" formnovalidate>Fechar</button>
         <button class="primary" value="send">Enviar teste</button>
       </menu>
+    </form>
+  </dialog>
+
+  <!-- Modal: número Coex (Cloud API) -->
+  <dialog id="dlg-cloud">
+    <form method="dialog" id="form-cloud">
+      <h3>Adicionar número Coex (Cloud API)</h3>
+      <p class="hint">
+        Para números que já passaram pelo onboarding de Coexistência (Embedded Signup do seu app na Meta ou de um BSP).
+        Os dados ficam no WhatsApp Manager / App Dashboard → WhatsApp → API Setup. Use um token de usuário do sistema
+        com <code>whatsapp_business_messaging</code> e <code>whatsapp_business_management</code>.
+      </p>
+      <label>Nome no Prospecter<input name="name" required pattern="[a-zA-Z0-9_\-]{2,40}" placeholder="coex-principal"></label>
+      <div class="row">
+        <label>Phone number ID<input name="phoneNumberId" required inputmode="numeric"></label>
+        <label>WABA ID<input name="wabaId" required inputmode="numeric"></label>
+      </div>
+      <label>Token de acesso<input name="accessToken" type="password" required autocomplete="off"></label>
+      <div id="cloud-result" class="result"></div>
+      <menu>
+        <button value="cancel" formnovalidate>Fechar</button>
+        <button class="primary" value="save">Conferir e adicionar</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Modal: conversa -->
+  <dialog id="dlg-conversation">
+    <form method="dialog">
+      <h3 id="conversation-title">Conversa</h3>
+      <div class="legend">
+        <span class="badge origin-api">Campanha (API)</span>
+        <span class="badge origin-app">Enviada pelo celular</span>
+        <span class="badge origin-history">Histórico importado</span>
+      </div>
+      <div id="conversation-messages" class="chat"></div>
+      <menu><button value="close">Fechar</button></menu>
     </form>
   </dialog>
 

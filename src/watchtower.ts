@@ -6,7 +6,7 @@ import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthTokens } fr
 import { config } from './config.ts';
 import { sql } from './db.ts';
 import { kvDelete, kvGet, kvSet } from './kv.ts';
-import { parseToolText, type WtProspect } from './watchtower-map.ts';
+import { matchesCnae, parseToolText, type CnaeFilter, type WtProspect } from './watchtower-map.ts';
 
 /**
  * Integração com o WatchTower via MCP (Streamable HTTP).
@@ -17,7 +17,10 @@ import { parseToolText, type WtProspect } from './watchtower-map.ts';
 export interface WtSettings {
   empresaId: string | null;
   annotateSends: boolean;
-  moveOnReply: boolean;
+  /** Mover o prospecto de etapa (de moveFromStageId para moveToStageId)... */
+  moveEnabled: boolean;
+  /** ...quando a mensagem é enviada ou quando o contato responde pela primeira vez. */
+  moveTrigger: 'send' | 'reply';
   moveFromStageId: string | null;
   moveToStageId: string | null;
 }
@@ -34,7 +37,8 @@ export interface WtStage {
 const DEFAULT_SETTINGS: WtSettings = {
   empresaId: null,
   annotateSends: true,
-  moveOnReply: true,
+  moveEnabled: true,
+  moveTrigger: 'send',
   moveFromStageId: null,
   moveToStageId: null,
 };
@@ -50,13 +54,39 @@ const KEY = {
 export const isConfigured = (): boolean => Boolean(config.watchtower.url);
 
 export async function getSettings(): Promise<WtSettings> {
-  return { ...DEFAULT_SETTINGS, ...(await kvGet<Partial<WtSettings>>(KEY.settings)) };
+  // Versões anteriores guardavam só "moveOnReply" (mover ao responder).
+  const { moveOnReply, ...stored } = (await kvGet<Partial<WtSettings> & { moveOnReply?: boolean }>(KEY.settings)) ?? {};
+  const legacy = moveOnReply !== undefined && stored.moveEnabled === undefined ? { moveEnabled: moveOnReply } : {};
+  return { ...DEFAULT_SETTINGS, ...legacy, ...stored };
 }
 
 export async function saveSettings(patch: Partial<WtSettings>): Promise<WtSettings> {
   const settings = { ...(await getSettings()), ...patch };
   await kvSet(KEY.settings, settings);
+  await enqueueMovesForSent(settings);
   return settings;
+}
+
+/**
+ * Com "mover no envio", garante que todo prospecto que já recebeu mensagem tenha a mudança de
+ * etapa na fila (inclusive os enviados antes de a opção existir). Idempotente; o processamento
+ * da fila só move quem ainda está na etapa de origem.
+ */
+export async function enqueueMovesForSent(settings?: WtSettings): Promise<number> {
+  const s = settings ?? (await getSettings());
+  if (!s.moveEnabled || s.moveTrigger !== 'send' || !s.moveFromStageId || !s.moveToStageId) return 0;
+  const res = await sql`
+    INSERT INTO watchtower_outbox (kind, prospect_id, payload)
+    SELECT DISTINCT 'move', c.wt_prospect_id,
+           jsonb_build_object('fromStageId', ${s.moveFromStageId}::text, 'toStageId', ${s.moveToStageId}::text)
+    FROM messages m JOIN contacts c ON c.id = m.contact_id
+    WHERE m.status = 'sent' AND c.wt_prospect_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM watchtower_outbox o
+        WHERE o.kind = 'move' AND o.prospect_id = c.wt_prospect_id AND o.payload->>'toStageId' = ${s.moveToStageId}::text
+      )`;
+  if (res.count) console.log(`[watchtower] ${res.count} mudança(s) de etapa enfileiradas para prospectos já contatados`);
+  return res.count;
 }
 
 // ---------- OAuth ----------
@@ -250,6 +280,7 @@ export async function listProspects(filters: {
   etapaId?: string;
   situacao?: string;
   busca?: string;
+  cnae?: CnaeFilter;
 }): Promise<WtProspect[]> {
   const base: Record<string, unknown> = { situacao: filters.situacao || 'abertos' };
   if (filters.etapaId) base.etapaId = filters.etapaId;
@@ -259,7 +290,7 @@ export async function listProspects(filters: {
   const byId = new Map<string, WtProspect>();
   for (const pastaId of pastas) {
     const list = await callTool<WtProspect[]>('listar_prospectos', pastaId ? { ...base, pastaId } : base);
-    for (const p of Array.isArray(list) ? list : []) byId.set(p.id, p);
+    for (const p of Array.isArray(list) ? list : []) if (matchesCnae(p, filters.cnae)) byId.set(p.id, p);
   }
   return [...byId.values()];
 }
@@ -324,6 +355,7 @@ async function processOutbox(): Promise<void> {
 }
 
 export function startOutbox(): void {
+  enqueueMovesForSent().catch((err) => console.warn('[watchtower] falha ao enfileirar mudanças de etapa:', err.message));
   setInterval(() => void processOutbox(), 10_000);
 }
 

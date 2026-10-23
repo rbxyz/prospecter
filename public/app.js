@@ -57,6 +57,8 @@ let currentTab = 'campaigns';
 const loaders = {
   campaigns: loadCampaigns,
   instances: loadInstances,
+  coex: loadCoex,
+  conversations: loadConversations,
   inbound: loadInbound,
   optouts: loadOptOuts,
   watchtower: loadWatchtower,
@@ -67,6 +69,7 @@ function showTab(tab) {
   currentTab = tab;
   $$('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $$('.panel').forEach((p) => (p.hidden = p.id !== `tab-${tab}`));
+  history.replaceState(null, '', tab === 'campaigns' ? location.pathname : `#${tab}`);
   run(loaders[tab]);
 }
 $$('.tab').forEach((btn) => btn.addEventListener('click', () => showTab(btn.dataset.tab)));
@@ -76,21 +79,75 @@ setInterval(() => {
   if (currentTab === 'campaigns' || currentTab === 'instances') run(loaders[currentTab]);
 }, 5000);
 
+// Aba Coex: só os contadores de webhook e os números, sem refazer a lista de templates na Meta.
+setInterval(() => {
+  if (document.hidden || $('dialog[open]') || currentTab !== 'coex') return;
+  run(loadCoex);
+}, 15000);
+
 // ---------- Números ----------
 let instances = [];
 
-async function loadInstances() {
-  instances = await api('/api/instances');
-  const list = $('#instance-list');
-  if (instances.length === 0) {
-    list.innerHTML = '<div class="empty">Nenhum número ainda. Adicione um acima e conecte pelo QR Code.</div>';
-    return;
-  }
-  list.innerHTML = instances
-    .map(
-      (i) => `
+const CLOUD_STATUS_LABEL = { connected: 'Conectado', disconnected: 'Desconectado pelo celular', error: 'Com erro' };
+const QUALITY_CLASS = { GREEN: 'open', YELLOW: 'paused', RED: 'close', FLAGGED: 'close', DOWNGRADE: 'close', UNFLAGGED: 'open', UPGRADE: 'open' };
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEBHOOK_FIELDS = [
+  'messages',
+  'smb_message_echoes',
+  'history',
+  'smb_app_state_sync',
+  'account_update',
+  'phone_number_quality_update',
+  'message_template_status_update',
+];
+
+const check = (ok, text) => `<li class="${ok ? 'ok' : 'todo'}">${text}</li>`;
+
+/** Card de um número da Cloud API (Coex): qualidade, sincronização das primeiras 24h e erros. */
+function cloudCard(i) {
+  const c = i.cloud;
+  const within24h = Date.now() - new Date(c.createdAt).getTime() < DAY_MS;
+  const history = c.historyError
+    ? `Histórico recusado ou com erro: ${esc(c.historyError)}`
+    : c.historySyncAt
+      ? `Histórico pedido em ${fmtDate(c.historySyncAt)}${c.historyProgress != null ? ` · ${c.historyProgress}% recebido` : ''}`
+      : 'Histórico ainda não importado';
+  return `
+      <div class="card" data-name="${esc(i.name)}" data-provider="cloud">
+        <header>
+          <h4>${esc(i.name)} <span class="badge kind-cloud">Coex</span></h4>
+          <span class="badge ${i.state}">${CLOUD_STATUS_LABEL[c.status] ?? c.status}</span>
+        </header>
+        <div class="meta">
+          ${esc(fmtPhone(i.number))}${i.profileName ? ` · ${esc(i.profileName)}` : ''}
+          ${c.quality ? ` · qualidade <span class="badge ${QUALITY_CLASS[c.quality] ?? ''}">${esc(c.quality)}</span>` : ''}
+        </div>
+        ${c.isOnBizApp === false ? '<div class="waiting">⚠️ A Meta indica que este número não está em coexistência com o WhatsApp Business.</div>' : ''}
+        ${c.error ? `<div class="waiting">⚠️ ${esc(c.error)}</div>` : ''}
+        <div class="stats"><span>Enviadas hoje: <b>${i.sentToday}</b> / ${i.dailyLimit}</span></div>
+        <ul class="steps compact">
+          ${check(Boolean(c.contactsSyncAt), c.contactsSyncAt ? `Contatos sincronizados em ${fmtDate(c.contactsSyncAt)}` : 'Contatos ainda não sincronizados')}
+          ${check(Boolean(c.historySyncAt) && !c.historyError, history)}
+        </ul>
+        ${!within24h && (!c.contactsSyncAt || !c.historySyncAt) ? '<div class="hint">Passaram 24h do cadastro: se a Meta recusar a sincronização, ela só volta refazendo o onboarding.</div>' : ''}
+        <div class="row" style="margin-top:8px">
+          <label>Limite diário<input type="number" min="1" value="${i.dailyLimit}" data-act="limit"></label>
+          <label class="check"><input type="checkbox" ${i.enabled ? 'checked' : ''} data-act="enabled"> Usar nos disparos</label>
+        </div>
+        <div class="actions">
+          <button data-act="sync-contacts">Sincronizar contatos</button>
+          ${c.historySyncAt ? '' : '<button data-act="sync-history">Importar histórico (uma vez)</button>'}
+          <button data-act="cloud-refresh">Conferir na Meta</button>
+          <button data-act="cloud-token">Trocar token</button>
+          <button class="danger" data-act="delete">Excluir</button>
+        </div>
+      </div>`;
+}
+
+function qrCard(i) {
+  return `
       <div class="card" data-name="${esc(i.name)}">
-        <header><h4>${esc(i.name)}</h4><span class="badge ${i.state}">${STATE_LABEL[i.state] ?? i.state}</span></header>
+        <header><h4>${esc(i.name)} <span class="badge kind-qr">QR Code</span></h4><span class="badge ${i.state}">${STATE_LABEL[i.state] ?? i.state}</span></header>
         <div class="meta">${i.number ? `${esc(fmtPhone(i.number))} · ${esc(i.profileName ?? '')}` : 'Não conectado'}</div>
         <div class="stats"><span>Enviadas hoje: <b>${i.sentToday}</b> / ${i.dailyLimit}</span></div>
         <div class="row" style="margin-top:8px">
@@ -102,29 +159,347 @@ async function loadInstances() {
           ${i.state === 'open' ? '<button data-act="logout">Desconectar</button>' : ''}
           <button class="danger" data-act="delete">Excluir</button>
         </div>
-      </div>`,
-    )
-    .join('');
+      </div>`;
 }
 
-$('#instance-list').addEventListener('click', (e) => {
-  const act = e.target.dataset?.act;
-  const name = e.target.closest('.card')?.dataset.name;
-  if (!name || !act) return;
-  if (act === 'connect') run(() => openQr(name));
-  if (act === 'logout' && confirm(`Desconectar ${name} do WhatsApp?`))
-    run(async () => (await api(`/api/instances/${name}/logout`, { method: 'POST' }), loadInstances()));
-  if (act === 'delete' && confirm(`Excluir o número ${name}? A sessão do WhatsApp será removida.`))
-    run(async () => (await api(`/api/instances/${name}`, { method: 'DELETE' }), loadInstances()));
-});
+async function loadInstances() {
+  instances = await api('/api/instances');
+  const list = $('#instance-list');
+  if (instances.length === 0) {
+    list.innerHTML = '<div class="empty">Nenhum número ainda. Adicione um por QR Code ou um número Coex acima.</div>';
+    return;
+  }
+  list.innerHTML = instances.map((i) => (i.provider === 'cloud' ? cloudCard(i) : qrCard(i))).join('');
+}
 
-$('#instance-list').addEventListener('change', (e) => {
+/** Recarrega a aba aberta depois de uma ação num número (a mesma ação existe em Números e em Coex). */
+const reloadCurrent = () => run(loaders[currentTab]);
+
+function onNumberClick(e) {
+  const act = e.target.dataset?.act;
+  const card = e.target.closest('.card');
+  const name = card?.dataset.name;
+  if (!name || !act) return;
+  const cloudNumber = card.dataset.provider === 'cloud';
+  const post = (path, body, done) =>
+    run(async () => {
+      await api(`/api/instances/${name}/${path}`, { method: 'POST', body });
+      if (done) toast(done);
+      reloadCurrent();
+    });
+
+  if (act === 'connect') run(() => openQr(name));
+  if (act === 'logout' && confirm(`Desconectar ${name} do WhatsApp?`)) post('logout');
+  if (act === 'delete') {
+    const msg = cloudNumber
+      ? `Tirar ${name} do Prospecter?\n\nO número continua conectado à Cloud API até ser desconectado pelo celular (WhatsApp Business → Configurações → Conta → Business Platform).`
+      : `Excluir o número ${name}? A sessão do WhatsApp será removida.`;
+    if (confirm(msg)) run(async () => (await api(`/api/instances/${name}`, { method: 'DELETE' }), reloadCurrent()));
+  }
+  if (act === 'cloud-refresh') post('cloud-refresh', undefined, 'Número conferido na Meta');
+  if (act === 'cloud-token') {
+    const accessToken = prompt(`Novo token de acesso para ${name}:`);
+    if (accessToken?.trim()) post('cloud-refresh', { accessToken }, 'Token trocado');
+  }
+  if (act === 'sync-contacts') post('cloud-sync', { type: 'contacts' }, 'Sincronização de contatos pedida; os contatos chegam pelos webhooks');
+  if (
+    act === 'sync-history' &&
+    confirm(
+      'Importar o histórico de conversas (até 6 meses)?\n\nA Meta só permite pedir UMA vez por onboarding, e só nas primeiras 24h. ' +
+        'Deixe o WhatsApp Business aberto no celular e com internet.',
+    )
+  )
+    post('cloud-sync', { type: 'history' }, 'Histórico pedido; os lotes chegam pelos webhooks');
+}
+
+function onNumberChange(e) {
   const act = e.target.dataset?.act;
   const name = e.target.closest('.card')?.dataset.name;
   if (!name) return;
   const body = act === 'limit' ? { dailyLimit: Number(e.target.value) } : act === 'enabled' ? { enabled: e.target.checked } : null;
   if (body) run(async () => (await api(`/api/instances/${name}`, { method: 'PATCH', body }), toast('Salvo')));
+}
+
+for (const list of ['#instance-list', '#coex-numbers']) {
+  $(list).addEventListener('click', onNumberClick);
+  $(list).addEventListener('change', onNumberChange);
+}
+
+// Botões "+ Número Coex" (aba Números, aba Coex e estado vazio).
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('[data-open-cloud]')) return;
+  $('#form-cloud').reset();
+  $('#cloud-result').textContent = '';
+  $('#dlg-cloud').showModal();
 });
+
+$('#form-cloud').addEventListener('submit', (e) => {
+  if (e.submitter?.value !== 'save') return;
+  e.preventDefault();
+  const f = e.target;
+  run(async () => {
+    $('#cloud-result').textContent = 'Conferindo o número na Meta…';
+    try {
+      const r = await api('/api/instances/cloud', {
+        method: 'POST',
+        body: { name: f.name.value.trim(), phoneNumberId: f.phoneNumberId.value, wabaId: f.wabaId.value, accessToken: f.accessToken.value },
+      });
+      $('#cloud-result').textContent =
+        `✅ ${r.info.verified_name ?? r.name} · ${r.info.display_phone_number ?? ''}` +
+        (r.info.is_on_biz_app ? ' · em Coex' : '') +
+        (r.warnings.length ? `\n\n⚠️ ${r.warnings.join('\n⚠️ ')}` : '') +
+        '\n\nPróximo passo: sincronize contatos e histórico nas primeiras 24h após o onboarding.';
+      f.accessToken.value = '';
+      cloudTemplates = null;
+      reloadCurrent();
+    } catch (err) {
+      $('#cloud-result').textContent = '';
+      throw err;
+    }
+  });
+});
+
+// ---------- Coex (Cloud API) ----------
+let coexStatus = null;
+let webhookCheck = null;
+
+const TEMPLATE_STATUS_CLASS = { APPROVED: 'open', PENDING: 'paused', IN_APPEAL: 'paused', REJECTED: 'close', PAUSED: 'close', DISABLED: 'close' };
+
+async function loadCoex() {
+  const [status, list] = await Promise.all([api('/api/cloud/status'), api('/api/instances')]);
+  coexStatus = status;
+  instances = list;
+  const numbers = list.filter((i) => i.provider === 'cloud');
+  $('#coex-numbers').innerHTML =
+    numbers.map(cloudCard).join('') ||
+    '<div class="empty card">Nenhum número Coex ainda.<br><br><button class="primary" data-open-cloud>+ Adicionar número Coex</button></div>';
+  renderCoexEvents(status.events);
+  $('#coex-fields').innerHTML = WEBHOOK_FIELDS.map((f) => `<code>${f}</code>`).join('');
+  if (numbers.length && !cloudTemplates) await loadTemplates().catch((err) => toast(err.message));
+  renderTemplates(numbers.length);
+  renderCoexSteps(status, numbers);
+  updateCoexDot(status, numbers);
+}
+
+function renderCoexSteps(s, numbers) {
+  const usable = (cloudTemplates ?? []).filter((t) => !t.problems.length).length;
+  const connected = numbers.some((n) => n.cloud.status === 'connected');
+  const steps = [
+    {
+      ok: s.appSecret,
+      title: 'Segredo do app (<code>META_APP_SECRET</code>)',
+      detail: 'App Dashboard → Configurações do app → Básico → Chave secreta do app. Confere a assinatura de cada webhook.',
+    },
+    {
+      ok: s.verifyToken,
+      title: 'Verify token (<code>META_VERIFY_TOKEN</code>)',
+      detail: 'Um texto qualquer inventado por você; o mesmo vai no cadastro do webhook na Meta.',
+    },
+    {
+      ok: s.publicHttps && webhookCheck?.ok !== false,
+      title: 'URL pública com HTTPS (<code>PUBLIC_URL</code>)',
+      detail:
+        `<div class="copy-field"><code>${esc(s.webhookUrl)}</code><button type="button" data-copy="url">Copiar</button>` +
+        `<button type="button" data-act="webhook-check">Testar URL pública</button></div>` +
+        (s.publicHttps ? '' : '<span>A Meta não alcança localhost: use um túnel (cloudflared, ngrok) ou um domínio com HTTPS.</span>') +
+        (webhookCheck ? `<div class="${webhookCheck.ok ? 'okmsg' : 'waiting'}">${webhookCheck.ok ? '✅' : '⚠️'} ${esc(webhookCheck.detail)}</div>` : ''),
+    },
+    {
+      ok: Boolean(s.events.lastReceivedAt),
+      title: 'Webhook cadastrado e recebendo eventos',
+      detail: 'WhatsApp → Configuration → Webhook: cole a URL e o verify token, clique em "Verify and save" e assine os campos ao lado. O app precisa estar em modo Live.',
+    },
+    {
+      ok: connected,
+      title: 'Número Coex conectado',
+      detail: numbers.length
+        ? `${numbers.length} número(s) cadastrado(s)${connected ? '' : ', nenhum conectado'}.`
+        : 'Depois do onboarding de Coexistência, clique em "+ Adicionar número Coex" com o Phone number ID, o WABA ID e um token de usuário do sistema.',
+    },
+    {
+      ok: usable > 0,
+      title: 'Template aprovado',
+      detail: usable
+        ? `${usable} template(s) prontos para campanha.`
+        : 'Crie no WhatsApp Manager → Modelos de mensagem um template de marketing com botão de "Parar promoções".',
+    },
+  ];
+  $('#coex-steps').innerHTML = steps
+    .map((st) => `<li class="${st.ok ? 'ok' : 'todo'}"><b>${st.title}</b><div class="hint">${st.detail}</div></li>`)
+    .join('');
+  if (!s.appSecret || !s.verifyToken) {
+    $('#coex-steps').insertAdjacentHTML(
+      'beforeend',
+      '<p class="hint">Depois de editar o <code>.env</code>, recrie o app: <code>docker compose up -d app</code>.</p>',
+    );
+  }
+}
+
+function renderCoexEvents(ev) {
+  const c = ev.counts;
+  const total = (c.done ?? 0) + (c.pending ?? 0) + (c.failed ?? 0);
+  const badge = $('#coex-events-badge');
+  badge.className = `badge ${c.failed ? 'close' : total ? 'open' : ''}`;
+  badge.textContent = c.failed ? `${c.failed} com falha` : total ? 'recebendo' : 'nenhum ainda';
+  $('#coex-events').innerHTML =
+    `<span>Recebidos <b>${total}</b></span><span>Processados <b>${c.done ?? 0}</b></span>` +
+    `<span>Na fila <b>${c.pending ?? 0}</b></span><span>Falharam <b>${c.failed ?? 0}</b></span>` +
+    `<span>Último: <b>${fmtDate(ev.lastReceivedAt)}</b></span>`;
+  $('#coex-failures').innerHTML = ev.failures
+    .map((f) => `${fmtDate(f.received_at)} · ${esc(f.fields.join(', ') || 'evento')} · ${esc(f.error ?? '')}`)
+    .join('<br>');
+  $('#coex-events-actions').innerHTML = c.failed ? '<button data-act="events-retry">Reprocessar falhas</button>' : '';
+}
+
+function updateCoexDot(s, numbers) {
+  const problem = numbers.some((n) => n.cloud.status !== 'connected' || n.cloud.error) || (numbers.length && (!s.appSecret || !s.verifyToken));
+  $('#coex-dot').hidden = !problem;
+}
+
+async function loadTemplates() {
+  cloudTemplates = await api('/api/cloud/templates');
+}
+
+function renderTemplates(hasNumbers) {
+  const rows = cloudTemplates ?? [];
+  $('#template-list').innerHTML =
+    rows
+      .map((t) => {
+        const usable = !t.problems.length;
+        const vars = t.placeholders.length ? t.placeholders.map((p) => `<code>{{${esc(p)}}}</code>`).join(' ') : 'sem variáveis';
+        return `<tr>
+          <td><b>${esc(t.name)}</b><div class="hint">${esc(t.language)} · ${vars}</div></td>
+          <td>${esc(t.category ?? '—')}</td>
+          <td><span class="badge ${TEMPLATE_STATUS_CLASS[t.status] ?? ''}">${esc(t.status)}</span></td>
+          <td><div class="template-body">${esc(t.body)}</div>${usable ? '' : `<div class="waiting">${esc(t.problems.join('; '))}</div>`}</td>
+          <td>${usable ? `<button data-template="${esc(templateKey(t))}">Criar campanha</button>` : ''}</td>
+        </tr>`;
+      })
+      .join('') ||
+    `<tr><td colspan="5" class="empty">${hasNumbers ? 'Nenhum template nesta WABA.' : 'Cadastre um número Coex para listar os templates da WABA.'}</td></tr>`;
+}
+
+$('#btn-coex-refresh').addEventListener('click', () => run(loadCoex));
+$('#btn-templates-refresh').addEventListener('click', () =>
+  run(async () => {
+    await loadTemplates();
+    await loadCoex();
+    toast('Templates atualizados');
+  }),
+);
+
+$('#tab-coex').addEventListener('click', async (e) => {
+  const copy = e.target.dataset?.copy;
+  if (copy) {
+    const text = copy === 'url' ? coexStatus?.webhookUrl : WEBHOOK_FIELDS.join(', ');
+    await navigator.clipboard?.writeText(text ?? '').then(
+      () => toast('Copiado'),
+      () => toast(text),
+    );
+  }
+  if (e.target.dataset?.act === 'webhook-check')
+    run(async () => {
+      e.target.disabled = true;
+      e.target.textContent = 'Testando…';
+      webhookCheck = await api('/api/cloud/webhook-check', { method: 'POST' });
+      await loadCoex();
+    });
+  if (e.target.dataset?.act === 'events-retry')
+    run(async () => {
+      const r = await api('/api/cloud/events/retry', { method: 'POST' });
+      toast(`${r.requeued} webhook(s) de volta para a fila`);
+      setTimeout(() => run(loadCoex), 1500);
+    });
+  const key = e.target.dataset?.template;
+  if (key) run(() => openCampaignForm(null, { provider: 'cloud', templateKey: key }));
+});
+
+// ---------- Conversas ----------
+const ORIGIN_LABEL = { api: 'Campanha (API)', app: 'Pelo celular', history: 'Histórico', contact: '' };
+// Tipos da Evolution (audioMessage...) e da Cloud API (audio...).
+const MEDIA_LABEL = {
+  audioMessage: '🎤 Áudio', audio: '🎤 Áudio',
+  imageMessage: '📷 Imagem', image: '📷 Imagem',
+  videoMessage: '🎬 Vídeo', video: '🎬 Vídeo',
+  documentMessage: '📄 Documento', document: '📄 Documento',
+  stickerMessage: 'Figurinha', sticker: 'Figurinha',
+  contactMessage: '👤 Contato', contacts: '👤 Contato',
+  locationMessage: '📍 Localização', location: '📍 Localização',
+  reactionMessage: 'Reação', reaction: 'Reação',
+  protocolMessage: 'Mensagem apagada ou editada',
+};
+let conversations = [];
+
+async function loadConversations() {
+  const q = $('#conv-search').value.trim();
+  conversations = await api(`/api/whatsapp/conversations${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+  $('#conv-list').innerHTML =
+    conversations
+      .map(
+        (c, idx) => `<tr class="clickable" data-idx="${idx}">
+          <td class="nowrap">${fmtDate(c.last_message_at)}</td>
+          <td><b>${esc(c.contact_name || c.push_name || '—')}</b>${c.empresa ? `<div class="hint">${esc(c.empresa)}</div>` : ''}
+            ${c.contact_id ? '' : '<span class="badge">fora das campanhas</span>'}</td>
+          <td class="nowrap">${esc(fmtPhone(c.phone))}</td>
+          <td class="nowrap">${esc((c.instances ?? []).join(', '))}</td>
+          <td>${c.sent}${c.sent_from_app ? `<div class="hint">${c.sent_from_app} pelo celular</div>` : ''}</td>
+          <td>${c.received}</td>
+          <td class="clip">${esc(c.last_text ?? '')}</td></tr>`,
+      )
+      .join('') || `<tr><td colspan="7" class="empty">${q ? 'Nada encontrado.' : 'Nenhuma conversa ainda. Clique em "Sincronizar agora".'}</td></tr>`;
+}
+
+let convSearchTimer;
+$('#conv-search').addEventListener('input', () => {
+  clearTimeout(convSearchTimer);
+  convSearchTimer = setTimeout(() => run(loadConversations), 300);
+});
+
+$('#btn-wa-sync').addEventListener('click', (e) =>
+  run(async () => {
+    const btn = e.target;
+    btn.disabled = true;
+    btn.textContent = 'Sincronizando…';
+    try {
+      const results = await api('/api/whatsapp/sync', { method: 'POST' });
+      $('#conv-sync-result').innerHTML = results.length
+        ? results
+            .map((r) =>
+              r.error
+                ? `⚠️ ${esc(r.instance)}: ${esc(r.error)}`
+                : `✅ ${esc(r.instance)}: ${r.contacts} contatos, ${r.messages} mensagens, ${r.linked} novos vínculos com contatos`,
+            )
+            .join('<br>')
+        : 'Nenhuma instância QR Code para sincronizar (os números Coex chegam pelos webhooks).';
+      await loadConversations();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sincronizar agora';
+    }
+  }),
+);
+
+$('#conv-list').addEventListener('click', (e) => {
+  const c = conversations[e.target.closest('tr')?.dataset.idx];
+  if (c) run(() => openConversation(c));
+});
+
+async function openConversation(c) {
+  const rows = await api(`/api/whatsapp/messages?key=${encodeURIComponent(c.key)}`);
+  $('#conversation-title').textContent = `${c.contact_name || c.push_name || 'Conversa'} · ${fmtPhone(c.phone)}`;
+  $('#conversation-messages').innerHTML =
+    rows
+      .map(
+        (m) => `<div class="msg ${m.from_me ? 'me' : 'them'}">
+          <div class="text">${m.text ? esc(m.text) : `<i>${esc(MEDIA_LABEL[m.type] ?? `[${m.type ?? 'mensagem'}]`)}</i>`}</div>
+          <small>${fmtDate(m.sent_at)} · ${esc(m.instance)}${ORIGIN_LABEL[m.origin] ? ` · <span class="badge origin-${m.origin}">${ORIGIN_LABEL[m.origin]}</span>` : ''}</small>
+        </div>`,
+      )
+      .join('') || '<div class="empty">Sem mensagens.</div>';
+  $('#dlg-conversation').showModal();
+  const box = $('#conversation-messages');
+  box.scrollTop = box.scrollHeight;
+}
 
 $('#form-new-instance').addEventListener('submit', (e) => {
   e.preventDefault();
@@ -189,13 +564,14 @@ async function loadCampaigns() {
       <div class="card" data-id="${c.id}">
         <header><h4>${esc(c.name)}</h4><span class="badge ${c.status}">${CAMPAIGN_LABEL[c.status]}</span></header>
         <div class="meta">
-          ${c.window_start}–${c.window_end} · ${esc(days)} · intervalo ${c.delay_min_s}–${c.delay_max_s}s${c.random_times ? ' · horários sorteados' : ''} ·
+          ${c.provider === 'cloud' ? `<span class="badge kind-cloud">Coex · ${esc(c.cloud_template?.name ?? '')}</span>` : '<span class="badge kind-qr">QR Code</span>'} ${c.window_start}–${c.window_end} · ${esc(days)} · intervalo ${c.delay_min_s}–${c.delay_max_s}s${c.random_times ? ' · horários sorteados' : ''} ·
           ${c.instances.length ? esc(c.instances.join(', ')) : 'todos os números'}
         </div>
         ${c.waiting ? `<div class="waiting">⏸ ${esc(c.waiting)}</div>` : ''}
         <div class="progress"><div style="width:${pct}%"></div></div>
         <div class="stats">
           <span>Total <b>${c.total}</b></span><span>Na fila <b>${c.pending}</b></span><span>Enviadas <b>${c.sent}</b></span>
+          ${c.provider === 'cloud' ? `<span>Entregues <b>${c.delivered}</b></span><span>Lidas <b>${c.read}</b></span>` : ''}
           <span>Responderam <b>${c.replied}</b></span><span>Falhas <b>${c.failed}</b></span>
           <span>Sem WhatsApp <b>${c.invalid}</b></span><span>Puladas <b>${c.skipped}</b></span>
           ${c.blocked ? `<span style="color:var(--danger)">Bloqueadas <b>${c.blocked}</b></span>` : ''}
@@ -239,22 +615,19 @@ $('#campaign-list').addEventListener('click', (e) => {
 
 $('#btn-new-campaign').addEventListener('click', () => run(() => openCampaignForm()));
 
-async function openCampaignForm(campaign) {
+/** `preset` (vindo da lista de templates da aba Coex): { provider: 'cloud', templateKey }. */
+async function openCampaignForm(campaign, preset = null) {
   const form = $('#form-campaign');
   form.reset();
   $('#campaign-preview').innerHTML = '';
   $('#campaign-form-title').textContent = campaign ? 'Editar campanha' : 'Nova campanha';
   instances = await api('/api/instances').catch(() => instances);
 
-  const selected = new Set(campaign?.instances ?? []);
-  $('#campaign-instances').innerHTML =
-    instances
-      .map(
-        (i) =>
-          `<label><input type="checkbox" name="instances" value="${esc(i.name)}" ${selected.has(i.name) ? 'checked' : ''}> ${esc(i.name)}
-           <span class="badge ${i.state}">${STATE_LABEL[i.state]}</span></label>`,
-      )
-      .join('') || '<span class="hint">Nenhum número cadastrado ainda.</span>';
+  editingCampaign = campaign ?? null;
+  presetTemplateKey = preset?.templateKey ?? null;
+  if (!preset) cloudTemplates = null; // recarrega: templates mudam de status na Meta
+  form.provider.value = campaign?.provider ?? preset?.provider ?? 'evolution';
+  await renderProviderFields();
 
   const days = new Set(campaign?.weekdays ?? [1, 2, 3, 4, 5]);
   $('#campaign-weekdays').innerHTML = WEEKDAYS.map(
@@ -264,7 +637,7 @@ async function openCampaignForm(campaign) {
   form.id.value = campaign?.id ?? '';
   if (campaign) {
     form.name.value = campaign.name;
-    form.template.value = campaign.template;
+    if (campaign.provider !== 'cloud') form.template.value = campaign.template;
     form.delayMinS.value = campaign.delay_min_s;
     form.delayMaxS.value = campaign.delay_max_s;
     form.windowStart.value = campaign.window_start;
@@ -275,9 +648,100 @@ async function openCampaignForm(campaign) {
   $('#dlg-campaign').showModal();
 }
 
+let editingCampaign = null;
+let presetTemplateKey = null;
+let cloudTemplates = null;
+const templateKey = (t) => `${t.waba_id}|${t.name}|${t.language}`;
+
+/** Mostra os campos do canal escolhido e só os números desse canal. */
+async function renderProviderFields() {
+  const form = $('#form-campaign');
+  const provider = form.provider.value;
+  const cloud = provider === 'cloud';
+  $('#campaign-evolution').hidden = cloud;
+  $('#campaign-cloud').hidden = !cloud;
+
+  const selected = new Set(editingCampaign?.instances ?? []);
+  const own = instances.filter((i) => (i.provider ?? 'evolution') === provider);
+  $('#campaign-instances').innerHTML =
+    own
+      .map(
+        (i) =>
+          `<label><input type="checkbox" name="instances" value="${esc(i.name)}" ${selected.has(i.name) ? 'checked' : ''}> ${esc(i.name)}
+           <span class="badge ${i.state}">${STATE_LABEL[i.state]}</span></label>`,
+      )
+      .join('') || `<span class="hint">Nenhum número ${cloud ? 'Coex (Cloud API)' : 'por QR Code'} cadastrado ainda.</span>`;
+
+  $('#campaign-preview').innerHTML = '';
+  if (!cloud) {
+    // Sem os campos do template, a validação do navegador não trava o salvar no canal QR Code.
+    $('#cloud-template-params').innerHTML = '';
+    return;
+  }
+  const select = form.cloudTemplate;
+  if (!cloudTemplates) {
+    select.innerHTML = '<option value="">Carregando templates da Meta…</option>';
+    cloudTemplates = await api('/api/cloud/templates').catch((err) => (toast(err.message), null));
+  }
+  const current = editingCampaign?.cloud_template;
+  const list = cloudTemplates ?? [];
+  const empty = $('#cloud-template-empty');
+  const hasCloud = instances.some((i) => i.provider === 'cloud');
+  empty.hidden = list.some((t) => !t.problems.length);
+  empty.innerHTML = !hasCloud
+    ? '⚠️ Nenhum número Coex cadastrado: adicione um na aba "Coex · Cloud API" para listar os templates.'
+    : '⚠️ Nenhum template aprovado e compatível nesta WABA. Crie um no WhatsApp Manager → Modelos de mensagem.';
+  select.innerHTML =
+    '<option value="">— escolha —</option>' +
+    list
+      .map(
+        (t) =>
+          `<option value="${esc(templateKey(t))}" ${t.problems.length ? 'disabled' : ''}>${esc(t.name)} (${esc(t.language)}, ${esc(t.category ?? '')})` +
+          `${t.problems.length ? ` — ${esc(t.problems.join('; '))}` : ''}</option>`,
+      )
+      .join('');
+  if (current) select.value = templateKey(current);
+  else if (presetTemplateKey) select.value = presetTemplateKey;
+  renderTemplateParams(current?.params ?? {});
+}
+
+/** Um campo por variável do corpo do template; variáveis nomeadas iguais às do contato já vêm preenchidas. */
+function renderTemplateParams(values = {}) {
+  const form = $('#form-campaign');
+  const t = (cloudTemplates ?? []).find((x) => templateKey(x) === form.cloudTemplate.value);
+  $('#cloud-template-body').textContent = t ? t.body : '';
+  $('#cloud-template-body').hidden = !t;
+  $('#cloud-template-params').innerHTML = (t?.placeholders ?? [])
+    .map((key) => {
+      const guess = t.format === 'NAMED' ? `{{${key}}}` : key === '1' ? '{{primeiro_nome}}' : '';
+      return `<label>Valor de <code>{{${esc(key)}}}</code><input data-param="${esc(key)}" value="${esc(values[key] ?? guess)}" required></label>`;
+    })
+    .join('');
+}
+
+$('#form-campaign').addEventListener('change', (e) => {
+  if (e.target.name === 'provider') run(renderProviderFields);
+  if (e.target.name === 'cloudTemplate') {
+    $('#campaign-preview').innerHTML = '';
+    renderTemplateParams();
+  }
+});
+
+function cloudTemplateFromForm() {
+  const form = $('#form-campaign');
+  const t = (cloudTemplates ?? []).find((x) => templateKey(x) === form.cloudTemplate.value);
+  if (!t) return null;
+  const params = Object.fromEntries($$('[data-param]', form).map((i) => [i.dataset.param, i.value]));
+  return { waba_id: t.waba_id, name: t.name, language: t.language, body: t.body, format: t.format, params };
+}
+
 $('#btn-preview').addEventListener('click', () =>
   run(async () => {
-    const { samples, errors } = await api('/api/preview', { method: 'POST', body: { template: $('#form-campaign').template.value } });
+    const form = $('#form-campaign');
+    const cloud = form.provider.value === 'cloud';
+    if (cloud && !cloudTemplateFromForm()) return toast('Escolha um template');
+    const body = cloud ? { cloudTemplate: cloudTemplateFromForm() } : { template: form.template.value };
+    const { samples, errors } = await api('/api/preview', { method: 'POST', body });
     $('#campaign-preview').innerHTML = errors.length
       ? errors.map((e) => `<p class="error">⚠️ ${esc(e)}</p>`).join('')
       : samples.map((s) => `<div>${esc(s)}</div>`).join('');
@@ -288,9 +752,11 @@ $('#form-campaign').addEventListener('submit', (e) => {
   if (e.submitter?.value !== 'save') return;
   e.preventDefault();
   const f = e.target;
+  const cloud = f.provider.value === 'cloud';
   const body = {
     name: f.name.value.trim(),
-    template: f.template.value,
+    provider: f.provider.value,
+    ...(cloud ? { cloudTemplate: cloudTemplateFromForm() } : { template: f.template.value }),
     instances: $$('input[name=instances]:checked', f).map((i) => i.value),
     weekdays: $$('input[name=weekdays]:checked', f).map((i) => Number(i.value)),
     delayMinS: Number(f.delayMinS.value),
@@ -301,6 +767,8 @@ $('#form-campaign').addEventListener('submit', (e) => {
     randomTimes: f.randomTimes.checked,
   };
   if (body.weekdays.length === 0) return toast('Escolha pelo menos um dia da semana');
+  if (cloud && !body.cloudTemplate) return toast('Escolha um template aprovado');
+  if (!cloud && !body.template.trim()) return toast('Escreva a mensagem');
   run(async () => {
     const id = f.id.value;
     const saved = await api(id ? `/api/campaigns/${id}` : '/api/campaigns', { method: id ? 'PATCH' : 'POST', body });
@@ -360,7 +828,7 @@ async function loadMessages() {
     rows
       .map(
         (m) => `<tr>
-          <td><span class="badge ${m.status}">${MESSAGE_LABEL[m.status]}</span></td>
+          <td><span class="badge ${m.status}">${MESSAGE_LABEL[m.status]}</span>${m.read_at ? ' · lida' : m.delivered_at ? ' · entregue' : ''}</td>
           <td>${esc(m.name || '—')}</td><td>${esc(fmtPhone(m.phone))}</td><td>${esc(m.instance ?? '—')}</td>
           <td>${fmtDate(m.sent_at)}</td><td>${fmtDate(m.replied_at)}</td>
           <td>${esc(m.error ?? m.text ?? '')}</td></tr>`,
@@ -418,8 +886,10 @@ async function startCampaign(campaign, force = false) {
 // ---------- Envio de teste ----------
 async function openTest(campaign) {
   instances = await api('/api/instances');
-  const open = instances.filter((i) => i.state === 'open');
-  if (open.length === 0) return toast('Conecte pelo menos um número antes de testar');
+  const provider = campaign.provider ?? 'evolution';
+  const open = instances.filter((i) => i.state === 'open' && (i.provider ?? 'evolution') === provider);
+  if (open.length === 0) return toast(provider === 'cloud' ? 'Cadastre um número Coex (Cloud API) antes de testar' : 'Conecte pelo menos um número antes de testar');
+  if (provider === 'cloud' && !confirm('O teste envia o template de verdade pela Cloud API e é cobrado como qualquer mensagem entregue. Continuar?')) return;
   const form = $('#form-test');
   form.reset();
   form.template.value = campaign.template;
@@ -533,7 +1003,8 @@ async function loadWatchtower() {
     form.moveFromStageId.value = s.settings.moveFromStageId ?? '';
     form.moveToStageId.value = s.settings.moveToStageId ?? '';
     form.annotateSends.checked = s.settings.annotateSends;
-    form.moveOnReply.checked = s.settings.moveOnReply;
+    form.moveEnabled.checked = s.settings.moveEnabled;
+    form.moveTrigger.value = s.settings.moveTrigger;
     updateStageWarning();
   }
 
@@ -567,7 +1038,8 @@ $('#form-wt-settings').addEventListener('submit', (e) => {
       body: {
         empresaId: f.empresaId.value,
         annotateSends: f.annotateSends.checked,
-        moveOnReply: f.moveOnReply.checked,
+        moveEnabled: f.moveEnabled.checked,
+        moveTrigger: f.moveTrigger.value,
         moveFromStageId: f.moveFromStageId.value,
         moveToStageId: f.moveToStageId.value,
       },
@@ -631,19 +1103,36 @@ $('#wt-pasta-filter').addEventListener('keydown', (e) => e.key === 'Enter' && e.
 
 $('#form-wt-import').addEventListener('submit', (e) => {
   const action = e.submitter?.value;
-  if (action !== 'preview' && action !== 'import') return;
+  if (!['preview', 'import', 'prune'].includes(action)) return;
   e.preventDefault();
   const f = e.target;
   const body = {
     etapaId: f.etapaId.value,
     situacao: f.situacao.value,
     busca: f.busca.value,
+    cnae: f.cnae.value,
     pastaIds: $$('input[name=pastaIds]:checked', f).map((i) => i.value),
   };
   const out = $('#wt-import-result');
   out.textContent = 'Consultando o WatchTower…';
   run(async () => {
     try {
+      if (action === 'prune') {
+        if (body.cnae === 'todos') return (out.textContent = 'Escolha "Só CNAE principal" ou "Só CNAE secundário" para aplicar à fila.');
+        const url = `/api/campaigns/${f.id.value}/watchtower-prune`;
+        const dry = await api(url, { method: 'POST', body: { cnae: body.cnae, dryRun: true } });
+        out.textContent = '';
+        if (!dry.removed) return (out.textContent = `Nada a remover: os ${dry.pendingBefore} contatos na fila já batem com o filtro.`);
+        const ok = confirm(
+          `${dry.removed} de ${dry.pendingBefore} contatos na fila não batem com o filtro e sairão da fila (as mensagens já enviadas não mudam).\n\n` +
+            `Ex.: ${dry.removedSample.join(', ')}\n\nRemover da fila?`,
+        );
+        if (!ok) return;
+        const r = await api(url, { method: 'POST', body: { cnae: body.cnae } });
+        out.textContent = `Removidos da fila: ${r.removed}\nContinuam na fila: ${r.kept}` + (r.notFoundInWatchtower ? `\nSem vínculo com o WatchTower (mantidos): ${r.notFoundInWatchtower}` : '');
+        loadCampaigns();
+        return;
+      }
       if (action === 'preview') {
         const r = await api('/api/watchtower/preview', { method: 'POST', body });
         out.textContent =
@@ -663,5 +1152,12 @@ $('#form-wt-import').addEventListener('submit', (e) => {
   });
 });
 
-if (location.hash === '#watchtower') showTab('watchtower');
+// Abre direto numa aba pelo endereço (ex.: /#coex, /#conversations); o OAuth do WatchTower volta em /#watchtower.
+const startTab = location.hash.slice(1);
+if (loaders[startTab]) showTab(startTab);
 else run(loadCampaigns);
+
+// Ponto de alerta na aba Coex (número desconectado/com erro ou .env incompleto), sem esperar abrir a aba.
+Promise.all([api('/api/cloud/status'), api('/api/instances')])
+  .then(([s, list]) => updateCoexDot(s, list.filter((i) => i.provider === 'cloud')))
+  .catch(() => {});
