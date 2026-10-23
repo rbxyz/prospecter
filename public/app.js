@@ -484,7 +484,26 @@ $('#conv-list').addEventListener('click', (e) => {
   if (c) run(() => openConversation(c));
 });
 
+// O servidor manda o arquivo como anexo; o navegador baixa sem sair da página.
+function download(url) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';
+  a.click();
+}
+
+$('#btn-conv-export').addEventListener('click', () => {
+  const q = $('#conv-search').value.trim();
+  download(`/api/whatsapp/export${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+});
+
+let openConversationKey = null;
+$('#btn-conversation-export').addEventListener('click', () => {
+  if (openConversationKey) download(`/api/whatsapp/export?key=${encodeURIComponent(openConversationKey)}`);
+});
+
 async function openConversation(c) {
+  openConversationKey = c.key;
   const rows = await api(`/api/whatsapp/messages?key=${encodeURIComponent(c.key)}`);
   $('#conversation-title').textContent = `${c.contact_name || c.push_name || 'Conversa'} · ${fmtPhone(c.phone)}`;
   $('#conversation-messages').innerHTML =
