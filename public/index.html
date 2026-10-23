@@ -103,6 +103,7 @@
         <div class="toolbar-actions">
           <input id="conv-search" type="search" placeholder="Buscar por nome, empresa ou telefone">
           <button id="btn-wa-sync">Sincronizar agora</button>
+          <button id="btn-conv-export" type="button" title="Baixa as conversas listadas (respeita a busca), agrupadas por cliente">Exportar JSON</button>
         </div>
       </div>
       <p class="hint">
@@ -389,7 +390,7 @@
         <span class="badge origin-history">Histórico importado</span>
       </div>
       <div id="conversation-messages" class="chat"></div>
-      <menu><button value="close">Fechar</button></menu>
+      <menu><button id="btn-conversation-export" type="button">Exportar JSON</button><button value="close">Fechar</button></menu>
     </form>
   </dialog>
 

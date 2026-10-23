@@ -16,6 +16,7 @@ import { evolution } from './evolution.ts';
 import { cloudCredentials, evolutionInstances, listInstances } from './instances.ts';
 import { normalizePhone, phoneKey } from './phone.ts';
 import { contactVars, renderChecked, renderTemplate, templateVars, validateTemplate } from './template.ts';
+import { groupByClient, type ExportRow } from './wa-export.ts';
 import { syncWhatsApp } from './wa-sync.ts';
 import * as wt from './watchtower.ts';
 import { matchesCnae, prospectToContact, type CnaeFilter } from './watchtower-map.ts';
@@ -114,6 +115,68 @@ async function checkCampaign(id: string) {
     problems,
     samples: checked.slice(0, 5).map((r) => ({ name: r.name, phone: r.phone, text: r.text, problems: r.problems })),
   };
+}
+
+/**
+ * Uma linha por número (o mesmo contato pode ter conversa @lid e @s.whatsapp.net), sem grupos.
+ * `q` filtra por telefone, nome do contato, empresa ou nome no WhatsApp.
+ */
+function findConversations(search: string, limit?: number) {
+  const q = search.trim();
+  const digits = q.replace(/\D/g, '');
+  const like = `%${q}%`;
+  return sql`
+    SELECT * FROM (
+      SELECT coalesce(m.phone_key, m.instance || ':' || m.jid) AS key,
+             max(m.phone) AS phone,
+             max(m.contact_id) AS contact_id,
+             max(c.name) AS contact_name,
+             max(c.vars->>'empresa') AS empresa,
+             (array_agg(m.push_name ORDER BY m.sent_at DESC) FILTER (WHERE m.push_name IS NOT NULL))[1] AS push_name,
+             array_agg(DISTINCT m.instance) AS instances,
+             count(*) FILTER (WHERE m.from_me)::int AS sent,
+             count(*) FILTER (WHERE m.from_me AND m.origin = 'app')::int AS sent_from_app,
+             count(*) FILTER (WHERE NOT m.from_me)::int AS received,
+             (array_agg(m.text ORDER BY m.sent_at DESC NULLS LAST) FILTER (WHERE m.text IS NOT NULL))[1] AS last_text,
+             max(m.sent_at) AS last_message_at
+      FROM wa_messages m LEFT JOIN contacts c ON c.id = m.contact_id
+      WHERE m.jid NOT LIKE '%@g.us'
+      GROUP BY 1
+    ) conv
+    ${
+      q
+        ? sql`WHERE contact_name ILIKE ${like} OR empresa ILIKE ${like} OR push_name ILIKE ${like}
+               ${digits.length >= 4 ? sql`OR phone LIKE ${`%${digits}%`}` : sql``}`
+        : sql``
+    }
+    ORDER BY last_message_at DESC NULLS LAST
+    ${limit ? sql`LIMIT ${limit}` : sql``}`;
+}
+
+/**
+ * Mensagens para a exportação, sem grupos. Com `q`, pega as conversas que batem com a busca e
+ * também as outras conversas dos mesmos contatos (outro número do mesmo cliente).
+ */
+async function exportRows({ key, q }: { key: string; q: string }): Promise<ExportRow[]> {
+  const convKey = sql`coalesce(m.phone_key, m.instance || ':' || m.jid)`;
+  let filter = sql``;
+  if (key) filter = sql`AND ${convKey} = ${key}`;
+  else if (q) {
+    const conv = await findConversations(q);
+    if (!conv.length) return [];
+    const ids = conv.filter((c) => c.contact_id != null).map((c) => String(c.contact_id));
+    filter = sql`AND (${convKey} = ANY(${sql.array(conv.map((c) => String(c.key)))}::text[])
+                      OR m.contact_id = ANY(${sql.array(ids)}::bigint[]))`;
+  }
+  return sql<ExportRow[]>`
+    SELECT m.wa_id, m.instance, i.display_phone AS instance_phone, m.jid, m.phone, m.phone_key,
+           m.from_me, m.type, m.text, m.push_name, m.sent_at, m.origin,
+           m.contact_id, c.name AS contact_name, c.vars AS contact_vars, c.wt_prospect_id
+    FROM wa_messages m
+    LEFT JOIN instances i ON i.name = m.instance
+    LEFT JOIN contacts c ON c.id = m.contact_id
+    WHERE m.jid NOT LIKE '%@g.us' ${filter}
+    ORDER BY m.sent_at NULLS FIRST, m.wa_id`;
 }
 
 const INSTANCE_NAME =/^[a-zA-Z0-9_-]{2,40}$/;
@@ -516,40 +579,35 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // ---------- Conversas das instâncias do WhatsApp ----------
   app.post('/api/whatsapp/sync', async () => syncWhatsApp());
 
+  app.get('/api/whatsapp/conversations', async (req) => findConversations(String((req.query as Body).q ?? ''), 500));
+
   /**
-   * Uma linha por número (o mesmo contato pode ter conversa @lid e @s.whatsapp.net), sem grupos.
-   * `q` filtra por telefone, nome do contato, empresa ou nome no WhatsApp.
+   * Baixa as conversas em JSON, agrupadas por cliente (groupByClient). Sem parâmetros exporta tudo;
+   * `q` usa o mesmo filtro da lista e `key` exporta uma conversa só.
    */
-  app.get('/api/whatsapp/conversations', async (req) => {
-    const q = String((req.query as Body).q ?? '').trim();
-    const digits = q.replace(/\D/g, '');
-    const like = `%${q}%`;
-    return sql`
-      SELECT * FROM (
-        SELECT coalesce(m.phone_key, m.instance || ':' || m.jid) AS key,
-               max(m.phone) AS phone,
-               max(m.contact_id) AS contact_id,
-               max(c.name) AS contact_name,
-               max(c.vars->>'empresa') AS empresa,
-               (array_agg(m.push_name ORDER BY m.sent_at DESC) FILTER (WHERE m.push_name IS NOT NULL))[1] AS push_name,
-               array_agg(DISTINCT m.instance) AS instances,
-               count(*) FILTER (WHERE m.from_me)::int AS sent,
-               count(*) FILTER (WHERE m.from_me AND m.origin = 'app')::int AS sent_from_app,
-               count(*) FILTER (WHERE NOT m.from_me)::int AS received,
-               (array_agg(m.text ORDER BY m.sent_at DESC NULLS LAST) FILTER (WHERE m.text IS NOT NULL))[1] AS last_text,
-               max(m.sent_at) AS last_message_at
-        FROM wa_messages m LEFT JOIN contacts c ON c.id = m.contact_id
-        WHERE m.jid NOT LIKE '%@g.us'
-        GROUP BY 1
-      ) conv
-      ${
-        q
-          ? sql`WHERE contact_name ILIKE ${like} OR empresa ILIKE ${like} OR push_name ILIKE ${like}
-                 ${digits.length >= 4 ? sql`OR phone LIKE ${`%${digits}%`}` : sql``}`
-          : sql``
-      }
-      ORDER BY last_message_at DESC NULLS LAST
-      LIMIT 500`;
+  app.get('/api/whatsapp/export', async (req, reply) => {
+    const query = req.query as Body;
+    const key = String(query.key ?? '').trim();
+    const q = String(query.q ?? '').trim();
+    const clients = groupByClient(await exportRows({ key, q }));
+    const now = new Date();
+    const day = now.toLocaleDateString('sv-SE', { timeZone: config.timezone });
+    return reply
+      .header('content-type', 'application/json; charset=utf-8')
+      .header('content-disposition', `attachment; filename="conversas-${day}.json"`)
+      .send(
+        JSON.stringify(
+          {
+            exportado_em: now.toISOString(),
+            filtro: key ? { conversa: key } : q ? { busca: q } : null,
+            total_clientes: clients.length,
+            total_mensagens: clients.reduce((n, c) => n + c.mensagens.length, 0),
+            clientes: clients,
+          },
+          null,
+          2,
+        ),
+      );
   });
 
   /** Mensagens de uma conversa (key = phone_key, ou "instância:jid" quando o número é desconhecido). */
