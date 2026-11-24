@@ -823,7 +823,7 @@ $('#form-import').addEventListener('submit', (e) => {
   run(async () => {
     const r = await api(`/api/campaigns/${f.id.value}/contacts`, { method: 'POST', body: { input: f.input.value } });
     $('#import-result').textContent =
-      `Linhas lidas: ${r.received}\nAdicionados à fila: ${r.queued}\nJá estavam na campanha: ${r.alreadyInCampaign}\n` +
+      `Linhas lidas: ${r.received}\nAdicionados à fila: ${r.queued}\nJá estavam na campanha: ${r.alreadyInCampaign}\nJá receberam mensagem antes (não serão enviados): ${r.alreadyContacted}\n` +
       `Duplicados no arquivo: ${r.duplicatesInFile}\nTelefones inválidos: ${r.invalid.length}` +
       (r.invalid.length ? `\n  ${r.invalid.slice(0, 20).join(', ')}${r.invalid.length > 20 ? '…' : ''}` : '');
     loadCampaigns();
@@ -1160,7 +1160,7 @@ $('#form-wt-import').addEventListener('submit', (e) => {
       } else {
         const r = await api(`/api/campaigns/${f.id.value}/watchtower-import`, { method: 'POST', body });
         out.textContent =
-          `Prospectos lidos: ${r.received}\nAdicionados à fila: ${r.queued}\nJá estavam na campanha: ${r.alreadyInCampaign}\n` +
+          `Prospectos lidos: ${r.received}\nAdicionados à fila: ${r.queued}\nJá estavam na campanha: ${r.alreadyInCampaign}\nJá receberam mensagem antes (não serão enviados): ${r.alreadyContacted}\n` +
           `Telefone repetido em outro prospecto: ${r.duplicatesInFile}\nSem telefone válido: ${r.invalid.length}`;
         loadCampaigns();
       }

@@ -6,6 +6,8 @@ export interface ImportResult {
   received: number;
   queued: number;
   alreadyInCampaign: number;
+  /** Entraram na campanha como "skipped" porque já receberam mensagem antes. */
+  alreadyContacted: number;
   duplicatesInFile: number;
   invalid: string[];
 }
@@ -27,7 +29,7 @@ export function importCsvToCampaign(campaignId: number, input: string): Promise<
 }
 
 export async function importContactsToCampaign(campaignId: number, inputs: ContactInput[]): Promise<ImportResult> {
-  const result: ImportResult = { received: inputs.length, queued: 0, alreadyInCampaign: 0, duplicatesInFile: 0, invalid: [] };
+  const result: ImportResult = { received: inputs.length, queued: 0, alreadyInCampaign: 0, alreadyContacted: 0, duplicatesInFile: 0, invalid: [] };
 
   const byKey = new Map<string, Record<string, unknown>>();
   for (const c of inputs) {
@@ -86,5 +88,29 @@ export async function importContactsToCampaign(campaignId: number, inputs: Conta
     WHERE m.contact_id = c.id AND m.campaign_id = ${campaignId}
       AND m.status = 'pending' AND c.opted_out_at IS NOT NULL`;
 
+  // Quem já recebeu mensagem antes (em qualquer campanha) também. O disparador confere de novo antes de enviar.
+  const contacted = await sql`
+    UPDATE messages m SET status = 'skipped', error = ${ALREADY_CONTACTED}
+    FROM contacts c
+    WHERE m.contact_id = c.id AND m.campaign_id = ${campaignId} AND m.status = 'pending'
+      AND EXISTS (
+        SELECT 1 FROM send_ledger l
+        WHERE l.phone_key = ANY(c.phone_keys) OR (c.wt_prospect_id IS NOT NULL AND l.wt_prospect_id = c.wt_prospect_id)
+      )`;
+  result.alreadyContacted = contacted.count;
+
   return result;
+}
+
+export const ALREADY_CONTACTED = 'contato já recebeu mensagem antes';
+
+/** Algum telefone do contato, ou o prospecto dele no WatchTower, está no registro de envios. */
+export async function wasContacted(contactId: number): Promise<boolean> {
+  const [row] = await sql<{ contacted: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1 FROM contacts c JOIN send_ledger l
+        ON l.phone_key = ANY(c.phone_keys) OR (c.wt_prospect_id IS NOT NULL AND l.wt_prospect_id = c.wt_prospect_id)
+      WHERE c.id = ${contactId}
+    ) AS contacted`;
+  return row.contacted;
 }
