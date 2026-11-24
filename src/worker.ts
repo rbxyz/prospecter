@@ -1,6 +1,8 @@
 import { cloud, CloudError } from './cloud.ts';
 import { classifyCloudError, renderCloud, type CloudTemplate, type CloudWaRow } from './cloud-map.ts';
+import type postgres from 'postgres';
 import { config } from './config.ts';
+import { ALREADY_CONTACTED, wasContacted } from './contacts.ts';
 import { sql } from './db.ts';
 import { evolution, EvolutionError, type EvolutionInstance } from './evolution.ts';
 import {
@@ -320,10 +322,21 @@ async function failAttempt(campaign: Campaign, msg: QueuedMessage, instance: str
   return true;
 }
 
+/** Registra no send_ledger os telefones e o prospecto do contato, na mesma transação do "sent". */
+function recordSend(tx: postgres.TransactionSql, campaign: Campaign, msg: QueuedMessage, number: string) {
+  return tx`
+    INSERT INTO send_ledger (phone_key, wt_prospect_id, source)
+    SELECT DISTINCT k, c.wt_prospect_id, ${`campanha ${campaign.id}`}
+    FROM contacts c, unnest(c.phone_keys || ${phoneKey(number)}::text) AS k
+    WHERE c.id = ${msg.contact_id}`;
+}
+
 /** Retorna true quando o número de fato enviou (ou tentou enviar) uma mensagem. */
 async function send(campaign: Campaign, msg: QueuedMessage, instance: string): Promise<boolean> {
   if (msg.opted_out_at) return markSkipped(msg.id, 'contato pediu para sair');
   if (campaign.skip_replied && msg.last_reply_at) return markSkipped(msg.id, 'contato já respondeu antes');
+  // Nunca envia duas vezes para a mesma pessoa, nem em campanhas diferentes.
+  if (await wasContacted(msg.contact_id)) return markSkipped(msg.id, ALREADY_CONTACTED);
   if (campaign.provider === 'cloud') return sendCloud(campaign, msg, instance);
 
   // Validação final: nunca envia com variável vazia ou marcação de template sobrando no texto.
@@ -342,11 +355,14 @@ async function send(campaign: Campaign, msg: QueuedMessage, instance: string): P
     const typingMs = Math.round(Math.min(8000, Math.max(2000, text.length * 40)));
     const res = await evolution.sendText(instance, number, text, typingMs);
 
-    await sql`
-      UPDATE messages
-      SET status = 'sent', text = ${text}, to_phone = ${number}, sent_at = now(),
-          wa_message_id = ${res.key?.id ?? null}, error = NULL
-      WHERE id = ${msg.id}`;
+    await sql.begin(async (tx) => {
+      await tx`
+        UPDATE messages
+        SET status = 'sent', text = ${text}, to_phone = ${number}, sent_at = now(),
+            wa_message_id = ${res.key?.id ?? null}, error = NULL
+        WHERE id = ${msg.id}`;
+      await recordSend(tx, campaign, msg, number);
+    });
     console.log(`[worker] campanha ${campaign.id}: enviado para ${number} via ${instance}`);
 
     if (msg.wt_prospect_id) {
@@ -382,10 +398,13 @@ async function sendCloud(campaign: Campaign, msg: QueuedMessage, instance: strin
   try {
     const res = await cloud.sendTemplate(creds.access_token, creds.phone_number_id, number, t, parameters);
     const waId = res.messages?.[0]?.id ?? null;
-    await sql`
-      UPDATE messages
-      SET status = 'sent', text = ${text}, to_phone = ${number}, sent_at = now(), wa_message_id = ${waId}, error = NULL
-      WHERE id = ${msg.id}`;
+    await sql.begin(async (tx) => {
+      await tx`
+        UPDATE messages
+        SET status = 'sent', text = ${text}, to_phone = ${number}, sent_at = now(), wa_message_id = ${waId}, error = NULL
+        WHERE id = ${msg.id}`;
+      await recordSend(tx, campaign, msg, number);
+    });
     console.log(`[worker] campanha ${campaign.id}: template "${t.name}" enviado para ${number} via ${instance} (Cloud API)`);
 
     // A Meta não ecoa o que sai pela API: o espelho de conversas registra aqui, com origem "api".

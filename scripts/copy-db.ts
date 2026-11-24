@@ -21,6 +21,7 @@ const TABLES = [
   'wa_contacts',
   'wa_messages',
   'cloud_events',
+  'send_ledger',
 ];
 
 const [fromUrl, toUrl] = process.argv.slice(2);
